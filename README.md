@@ -10,7 +10,7 @@ SentinelDesk takes an incoming support ticket (English or German) and:
 
 ## Status board
 
-_Last updated 14:34. Update this table in the same commit as your work: change the status, add your name. Run `python check_rules.py` before every push._
+_Last updated 14:55. Update this table in the same commit as your work: change the status, add your name. Run `python check_rules.py` before every push._
 
 | Status | Piece | File | Owner | Notes |
 |---|---|---|---|---|
@@ -24,16 +24,16 @@ _Last updated 14:34. Update this table in the same commit as your work: change t
 | ✅ Done | Hybrid retrieval (BM25 + dense + RRF) | retrieve.py | Chirag | `from retrieve import search`. Self-check: `python retrieve.py check`. Needs the shared index from `python scripts/embed.py`. σ = 0.86. See [Retrieval results](#retrieval-results) |
 | ✅ Done | Triage: critical detector → TF-IDF model → neighbour votes → ensemble + calibration | sentineldesk/triage/, scripts/*_triage.py | SPGOHIL09 | `Triage.load("artifacts").predict(subject, body)`; see sentineldesk/triage/README.md. Trains in ~6 min on a laptop (or Colab: notebooks/triage_colab.ipynb) and builds the shared `data/index/` (e5-base). Applied the data audit: family-based half A/B, `\n`/`<br>` cleaning, known vs novel holdout slices; ensemble = weighted average (beat the LogReg combiner). Neighbour search uses NumPy, **not FAISS**: FAISS loaded after PyTorch segfaults/hangs on macOS |
 | ✅ Done | Pipeline glue: `Pipeline().handle(subject, body)` → everything the console shows | pipeline.py | Chirag | mask → language → triage → search → gate → draft → verify. ~25–30 ms without the LLM. Self-check: `python pipeline.py`. Drafter is pluggable: `Pipeline(drafter=fn)`, `fn(text, hits, lang) -> {reply, cited_ids, unsupported_asks}`. Uses `sentineldesk.verify` once PR #5 merges |
-| 🔨 First version | Escalation gate (rules + reason strings) | pipeline.py `gate()` | Chirag (until someone takes it) | Escalates on: critical detector fires, high-priority Incident, low type/priority confidence, best similarity < σ, unsupported asks, failed verify. Low **queue** confidence only flags "routing uncertain" + top-2 queues |
+| ✅ Done | Escalation gate (rules + reason strings) | pipeline.py `gate()` | Chirag | Three badges, highest wins. 🔴 `ESCALATE_ON_CALL`: critical detector fires, or predicted high-priority Incident (no draft). 🟠 `HUMAN_REVIEW`: low **type** confidence, best similarity < σ, unsupported asks, failed verify, drafting unavailable, empty ticket (verified draft shown, `draft_sent: false`; none when there is no precedent). 🟢 `AUTO_DRAFT_READY`. Low queue / priority confidence are flags only (`routing_uncertain`, `priority_uncertain` + top-2). Half B (1,157, in-sample for thresholds): 48% on-call, 2% review, 50% auto; high-priority Incident recall 92.3%. Self-check: `python pipeline.py`. Note: the console still uses its own stand-in `ui/gate.py` (same status names) |
 | ✅ Done | Draft (step ④: LLM writes the reply from retrieved answers, JSON output) | sentineldesk/draft.py | Chirag | `draft(ticket_text, hits, lang)` → `{reply, cited_ids, unsupported_asks, model, latency_ms}`; raises `DraftError` (→ escalate "drafting unavailable"). Feeds straight into `verify()`. Live test: 5/5 normal en/de tickets pass verify in ~1.5 s, 2/2 refund/prompt-injection attacks escalate. Needs `GEMINI_API_KEY` |
-| 🔨 In progress | Verify (step ⑤: rule checks on every LLM draft; fails → escalate) | | Aashay | PR #5 open, not merged yet |
+| 🔨 In review | Verify (step ⑤: rule checks on every LLM draft; fails → escalate) | sentineldesk/verify.py, tests/test_verify.py | Aashay | 6 rule checks, about 1 ms per draft (worst case under 0.1 s; ticket and answers capped at 20,000 characters), no new dependencies, 161 tests (incl. three cold-review passes), 0 false blocks on 1,000 real KB answers. PR #5, not merged yet. Interface below |
 | 🔨 In progress | Live console UI | app.py, ui/, scripts/build_ui_report.py | Sudeep | Streamlit (proposed). `python scripts/build_ui_report.py` once (sidebar threshold captions + burst threshold, from half B), then `streamlit run app.py`. Uses pii.py, language.py, triage and `retrieve.search` (hybrid); σ = 0.86 against the best similarity in the results. Stand-ins in ui/ (listed under "Pipeline components"): the 3-way gate with reason codes, and an offline extractive draft + verify until sentineldesk/draft.py (Gemini) and verify (PR #5) are wired in. Bonus: burst detection. `SENTINELDESK_UI_MOCK=1` runs it without models. Tests: tests/test_ui.py |
 | 🔨 Ready, not run | Eval script: Macro-F1 + high-priority Incident recall, "ML only" vs "ML + rules", latency | scripts/eval_triage.py | SPGOHIL09 | Triage part written and tested on a sample. Run on the holdout **once**, at the end |
 | ✅ Done | requirements.txt | requirements.txt | SPGOHIL09 | scikit-learn pinned to 1.7.2 (models are pickled on Colab, loaded on the laptop) |
 | ⬜ To do | Demo script + rehearsal | | | Last hour |
 | ⬜ Bonus | Cross-lingual matching (comes from the dense embeddings), burst detection | | | Only after the MVP works |
 
-**Blocking decisions** (see [Open decisions](#open-decisions)): the LLM, the UI framework, team roles, what happens after "Escalate", and the similarity threshold.
+**Blocking decisions** (see [Open decisions](#open-decisions)): the LLM, the UI framework, and team roles.
 
 ## The problem
 
@@ -132,10 +132,14 @@ We use classical ML where results must be measurable, rules where we can't affor
         │                        returns JSON {reply, cited_ids, unsupported_asks}
         │                                         ▼
         │                     ⑤ VERIFY (rules)
-        │                        • cited_ids ⊆ retrieved ticket_ids
+        │                        • cited_ids ⊆ retrieved ticket_ids (at least one)
         │                        • every number / € / $ / % / SLA term ("within X days")
         │                          in the reply must also appear in a retrieved answer
-        │                        • keep placeholders like <name>, <acc_num> as they are
+        │                          (plain numbers like versions may also come from the ticket)
+        │                        • keep placeholders like <name>, <acc_num> as they are;
+        │                          no invented email / phone / account numbers / links
+        │                        • reply (and every sentence) in the ticket's language;
+        │                          unsupported_asks empty
         │                        • check fails → escalate instead of showing the draft
         ▼                                         ▼
   🔴 Escalate to On-Call (reason)        🟢 Auto-Draft Ready
@@ -301,6 +305,36 @@ Retrieval and the classifier share one file. `scripts/build_split.py` then `scri
   - `meta.json`: model + prefix
 - **Run `python check_rules.py` after building.** It verifies the index holds only 80%-split tickets.
 
+### 🔒 Interface: `verify()`
+
+The rule check that runs on every LLM draft. A draft is shown only if `passed` is `True`; otherwise the ticket escalates with the listed reasons.
+
+```python
+from sentineldesk.verify import verify
+verify(draft, retrieved, ticket_text, lang)
+  -> {"passed": bool,
+      "failures": [{"check", "code", "detail"}, ...],    # every failed check, for the escalation reasons
+      "checks":   [{"check", "passed", "evidence"}, ...]}  # all six, for the YES/NO list in the UI
+```
+
+| Input | Meaning |
+|---|---|
+| `draft` | The LLM's JSON: `{"reply": str, "cited_ids": [str], "unsupported_asks": [str]}` |
+| `retrieved` | The `search()` results the LLM was given |
+| `ticket_text` | The customer's ticket, PII-masked |
+| `lang` | `en`/`de` from `sentineldesk/language.py` |
+
+| Check | Fails when | Code |
+|---|---|---|
+| `format` | `reply` empty, over 250 words or over 3,000 characters, or a list field isn't a list (never crashes on bad input) | `VERIFY_FAILED` |
+| `citations` | A cited ID (in `cited_ids` or written `TKT-xxxxx` in the reply) wasn't retrieved, or nothing is cited | `VERIFY_FAILED` |
+| `numbers` | Every number-bearing claim must be grounded **in the tickets the draft cites**. An amount (€/$/£/EUR/USD/CHF, `50,-`, with `k`/`Mio.`/`million`/`Tausend`), its billing period (`per month`, `monthly`, `pro Jahr`, `per user`), a % , or a quantity with a unit (days, hours, weeks, years, weekends, quarters, billing cycles, GB, users, times…; en + de, up to three words apart) must appear there with the same value, unit and period. A bare number after a money word ("a refund of 500") counts as an amount, unless it's labelled as an ID ("order 12345"). Plain numbers, dates and times may also come from the customer's ticket. Also read: number words ("twenty-four", "vierundzwanzig", "zwei Millionen"), "an hour"/"eines Tages" = 1, halves and quarters ("half an hour", "one and a half", "zweieinhalb", "anderthalb", "Viertelstunde"), "fortnight", "tenfold", ranges (both ends), German compounds ("zweiwöchige", "14-tägiger", "Geschäftstagen"), times ("2 pm", "14 Uhr"), month-name dates. Separators are read by language; money never has 3 decimals; a swappable slash date must match exactly; full-width/superscript digits are normalised. "Windows 10 users" reads as a version when the ticket or a source names it | `VERIFY_FAILED` |
+| `placeholders` | The reply uses a `<placeholder>` no source has (any case), or contains an email, phone or account number `pii.mask()` would catch, a link or bare domain on any TLD (incl. Unicode lookalikes like `pаypal.com`) that isn't exactly a link, or the host of a link, in a source, or a spelled-out email (`name(at)firma.de`, `{at}`, "x at y dot com"). File names (`setup.log`) aren't links | `VERIFY_FAILED` |
+| `language` | The reply, any full sentence (6+ words), or any run of 2–3 short sentences isn't in the ticket's language. A source's language is read from its text, never the `language` column. Replies under 8 words aren't judged | `VERIFY_FAILED` |
+| `unsupported_asks` | The LLM listed anything it couldn't ground | `UNSUPPORTED_ASK` |
+
+Run the tests: `python -m pytest tests/test_verify.py -q`.
+
 ### Retrieval results
 
 `python retrieve.py check`, on the 80% split only (300 queries from half A, each excluded from its own results), plus 13 hand-typed tickets and 12 off-topic probes written for the check:
@@ -359,7 +393,7 @@ Retrieval and the classifier share one file. `scripts/build_split.py` then `scri
 | Retrieval | dense only / hybrid | | ✅ hybrid: BM25 + dense, fused with RRF |
 | Vector store | FAISS / Chroma / numpy | | Triage uses **numpy** (exact search, ~ms for 23k rows). ⚠️ Avoid FAISS on macOS: imported after PyTorch has run, it segfaults (GPU) or hangs (CPU) |
 | UI | Streamlit / Gradio / other | Sudeep | ✅ Streamlit (`app.py`, `ui/`; adds `streamlit` to requirements.txt) |
-| What happens after "Escalate" | | | |
-| What the AI draft must contain | | | |
+| What happens after "Escalate" | one badge / two levels | Chirag | ✅ two levels. **On-call** (critical detector or predicted high-priority Incident): no draft, a person acts now. **Human review** (everything else that escalates): the agent sees the verified draft, marked not sent; no draft without a precedent. **Dropped:** low priority confidence as an escalation rule. On half B it alone sent 39% of tickets to a human (89% escalated in total vs 50% without it) for +6 pts high-priority Incident recall (98.1% vs 92.3%); it is now a flag. Critical detector target stays at 90% recall |
+| What the AI draft must contain | | Aashay | ✅ JSON `{reply, cited_ids, unsupported_asks}`, checked by [`verify()`](#-interface-verify). Amounts, percentages and durations must come from a retrieved answer; plain numbers, dates and times may also come from the customer's own ticket (so "PHP 8.0" or an order number isn't blocked, but "I was charged €500" doesn't let the reply promise €500). Verify requires at least one citation, fails (never repairs) on an unretrieved citation, and also checks reply language and `unsupported_asks` |
 | Confidence and similarity thresholds | | | Critical threshold: catch ≥ 90% of high-priority Incidents, tuned on half B. Confidence threshold: tuned on half B. ✅ Similarity threshold: σ = 0.86 for e5-base, between the highest off-topic probe (0.853) and the lowest hand-typed ticket (0.870). See [Retrieval results](#retrieval-results) |
 | Team roles (5 people) | | | |
