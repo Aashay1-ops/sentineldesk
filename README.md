@@ -10,7 +10,7 @@ SentinelDesk takes an incoming support ticket (English or German) and:
 
 ## Status board
 
-_Last updated 14:15. Update this table in the same commit as your work: change the status, add your name. Run `python check_rules.py` before every push._
+_Last updated 14:34. Update this table in the same commit as your work: change the status, add your name. Run `python check_rules.py` before every push._
 
 | Status | Piece | File | Owner | Notes |
 |---|---|---|---|---|
@@ -27,7 +27,7 @@ _Last updated 14:15. Update this table in the same commit as your work: change t
 | 🔨 First version | Escalation gate (rules + reason strings) | pipeline.py `gate()` | Chirag (until someone takes it) | Escalates on: critical detector fires, high-priority Incident, low type/priority confidence, best similarity < σ, unsupported asks, failed verify. Low **queue** confidence only flags "routing uncertain" + top-2 queues |
 | ✅ Done | Draft (step ④: LLM writes the reply from retrieved answers, JSON output) | sentineldesk/draft.py | Chirag | `draft(ticket_text, hits, lang)` → `{reply, cited_ids, unsupported_asks, model, latency_ms}`; raises `DraftError` (→ escalate "drafting unavailable"). Feeds straight into `verify()`. Live test: 5/5 normal en/de tickets pass verify in ~1.5 s, 2/2 refund/prompt-injection attacks escalate. Needs `GEMINI_API_KEY` |
 | 🔨 In progress | Verify (step ⑤: rule checks on every LLM draft; fails → escalate) | | Aashay | PR #5 open, not merged yet |
-| 🔨 In progress | Live console UI | | Sudeep | |
+| 🔨 In progress | Live console UI | app.py, ui/, scripts/build_ui_report.py | Sudeep | Streamlit (proposed). `python scripts/build_ui_report.py` once (sidebar threshold captions + burst threshold, from half B), then `streamlit run app.py`. Uses pii.py, language.py, triage and `retrieve.search` (hybrid); σ = 0.86 against the best similarity in the results. Stand-ins in ui/ (listed under "Pipeline components"): the 3-way gate with reason codes, and an offline extractive draft + verify until sentineldesk/draft.py (Gemini) and verify (PR #5) are wired in. Bonus: burst detection. `SENTINELDESK_UI_MOCK=1` runs it without models. Tests: tests/test_ui.py |
 | 🔨 Ready, not run | Eval script: Macro-F1 + high-priority Incident recall, "ML only" vs "ML + rules", latency | scripts/eval_triage.py | SPGOHIL09 | Triage part written and tested on a sample. Run on the holdout **once**, at the end |
 | ✅ Done | requirements.txt | requirements.txt | SPGOHIL09 | scikit-learn pinned to 1.7.2 (models are pickled on Colab, loaded on the laptop) |
 | ⬜ To do | Demo script + rehearsal | | | Last hour |
@@ -358,7 +358,7 @@ Retrieval and the classifier share one file. `scripts/build_split.py` then `scri
 | Classifier | embeddings + logistic regression / TF-IDF / neighbour votes / ensemble / fine-tuned transformer | | ✅ ensemble of (0) embeddings + LogReg, (1) TF-IDF + LogReg and (2) neighbour votes, combined by (6) (weighted average of log-probs, weights fit on half A; updated after the data audit: it beat the LogReg combiner by +5 points mean Macro-F1 on new tickets) and calibrated on half B; (5) critical detector replaces the keyword overrides. See [Triage in detail](#triage-in-detail-options-0-1-2-5-6) |
 | Retrieval | dense only / hybrid | | ✅ hybrid: BM25 + dense, fused with RRF |
 | Vector store | FAISS / Chroma / numpy | | Triage uses **numpy** (exact search, ~ms for 23k rows). ⚠️ Avoid FAISS on macOS: imported after PyTorch has run, it segfaults (GPU) or hangs (CPU) |
-| UI | Streamlit / Gradio / other | | |
+| UI | Streamlit / Gradio / other | Sudeep | ✅ Streamlit (`app.py`, `ui/`; adds `streamlit` to requirements.txt) |
 | What happens after "Escalate" | | | |
 | What the AI draft must contain | | | |
 | Confidence and similarity thresholds | | | Critical threshold: catch ≥ 90% of high-priority Incidents, tuned on half B. Confidence threshold: tuned on half B. ✅ Similarity threshold: σ = 0.86 for e5-base, between the highest off-topic probe (0.853) and the lowest hand-typed ticket (0.870). See [Retrieval results](#retrieval-results) |

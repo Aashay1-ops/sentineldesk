@@ -12,3 +12,4 @@ sentence-transformers>=3.0
 torch>=2.2            # Colab: keep the preinstalled CUDA build (pip leaves it alone)
 matplotlib>=3.8
 pytest>=8.0
+streamlit>=1.46,<2    # live console UI (app.py); proposed, see README "Open decisions"
