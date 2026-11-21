@@ -13,3 +13,4 @@ torch>=2.2            # Colab: keep the preinstalled CUDA build (pip leaves it a
 faiss-cpu>=1.8        # optional at runtime: neighbours.py falls back to exact NumPy search
 matplotlib>=3.8
 pytest>=8.0
+streamlit>=1.46,<2    # live console UI (app.py); proposed, see README "Open decisions"

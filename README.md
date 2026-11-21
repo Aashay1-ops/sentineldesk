@@ -25,7 +25,7 @@ _Last updated 12:00. Update this table in the same commit as your work: change t
 | ✅ Done | Triage: critical detector → TF-IDF model → neighbour votes → ensemble + calibration | sentineldesk/triage/, scripts/*_triage.py | SPGOHIL09 | `Triage.load("artifacts").predict(subject, body)`; see sentineldesk/triage/README.md. Trains on Colab via notebooks/triage_colab.ipynb (~10 min on T4), which also builds the shared `data/index/` (e5-base). Falls back to model 0 + critical detector if ensemble files are missing |
 | ⬜ To do | Escalation gate (rules + reason strings) | | | Needs triage + retrieval outputs |
 | ⬜ To do | Draft (Gemini, JSON output) + verify step | | **unassigned** | Blocked on choosing the LLM. Can start now with mocked retrieval results |
-| ⬜ To do | Live console UI | | **unassigned** | Blocked on choosing the UI framework. Can start now with mocked outputs |
+| 🔨 In progress | Live console UI | app.py, ui/, scripts/build_ui_report.py | | Streamlit (proposed). `streamlit run app.py` after `python scripts/build_ui_report.py` (sidebar threshold captions + burst threshold, from half B). Real PII mask, language and triage. Stand-ins in ui/ (listed under "Pipeline components") for search (dense only), the 3-way gate with reason codes, and draft + verify (offline extractive; ui/llm.py is the hook for the team's LLM once chosen, off in the UI). Bonus: burst detection. `SENTINELDESK_UI_MOCK=1` runs it without models. Tests: tests/test_ui.py |
 | 🔨 Ready, not run | Eval script: Macro-F1 + high-priority Incident recall, "ML only" vs "ML + rules", latency | scripts/eval_triage.py | SPGOHIL09 | Triage part written and tested on a sample. Run on the holdout **once**, at the end |
 | ✅ Done | requirements.txt | requirements.txt | SPGOHIL09 | scikit-learn pinned to 1.7.2 (models are pickled on Colab, loaded on the laptop) |
 | ⬜ To do | Demo script + rehearsal | | | Last hour |
@@ -317,7 +317,7 @@ Retrieval and the classifier share one file. Build it with **exactly** these set
 | Classifier | embeddings + logistic regression / TF-IDF / neighbour votes / ensemble / fine-tuned transformer | | ✅ ensemble of (0) embeddings + LogReg, (1) TF-IDF + LogReg and (2) neighbour votes, combined and calibrated by (6); (5) critical detector replaces the keyword overrides. See [Triage in detail](#triage-in-detail-options-0-1-2-5-6) |
 | Retrieval | dense only / hybrid | | ✅ hybrid: BM25 + dense, fused with RRF |
 | Vector store | FAISS / Chroma / numpy | | |
-| UI | Streamlit / Gradio / other | | |
+| UI | Streamlit / Gradio / other | | 🟡 Proposed: Streamlit (triage already assumes `st.cache_resource`; adds `streamlit` to requirements.txt). Confirm with the team |
 | What happens after "Escalate" | | | |
 | What the AI draft must contain | | | |
 | Confidence and similarity thresholds | | | Critical threshold: catch ≥ 90% of high-priority Incidents, tuned on half B. Confidence threshold: tuned on half B. Similarity threshold: start at σ ≈ 0.87 for e5-base (in-domain top-1 median 0.954, highest off-topic probe 0.854); finalize on the full index, on the 80% split |
