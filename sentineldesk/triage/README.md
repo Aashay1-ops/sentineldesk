@@ -42,9 +42,25 @@ Add `--sample 2000` to any script for a quick run. Sample runs go to `artifacts/
 
 ## Where each split part goes
 
+`build_split.py` writes `kb` (the 80% split) and the holdout. `train_triage.py` then cuts `kb` into three parts **by paraphrase family**: tickets with embedding cosine ≥ 0.98 are reworded copies and always land in the same part (`docs/DATA_PREPROCESSING.md`, items 3–4). The parts it used are saved to `artifacts/splits/{train,half_a,half_b,families}.parquet`.
+
 | Part | Size | Used for |
 |---|---|---|
-| `train` | ~20.6k | TF-IDF, model 0, model 1, critical detector, neighbour index |
-| `half_a` | ~1.1k | ensemble (6) |
-| `half_b` | ~1.1k | temperature scaling, critical threshold (recall ≥ 0.90), suggested confidence thresholds |
-| `test` | ~5.7k | `eval_triage.py` only. Labels are read only after predictions are saved |
+| `train` | ~20.5k | TF-IDF, model 0, model 1, critical detector, neighbour index |
+| `half_a` | ~1.2k | ensemble (6): 3 weights per task, weighted average of log-probabilities |
+| `half_b` | ~1.2k | temperature scaling, critical threshold (recall ≥ 0.90), suggested confidence thresholds. No reworded copy in `train`, so these numbers are what to expect on **new** tickets |
+| `test` | ~5.7k | `eval_triage.py` only. Labels are read only after predictions are saved. Reported for all / known (reworded copy in kb) / novel tickets |
+
+## Changes made after the data audit
+
+Measured on the family-based half B. Differences under 0.01 are noise for 1.2k tickets.
+
+| Change | Result | Kept? |
+|---|---|---|
+| Halves A/B drawn by family | Honest numbers for new tickets (queue ~0.36, priority ~0.46, vs 0.53 / 0.63 on a random half B) | ✅ |
+| Weighted average instead of the LogReg combiner | **+5 points** mean Macro-F1 (queue +7, priority +5); the LogReg combiner scored below TF-IDF alone | ✅ |
+| `\n` / `<br>` cleaning (TF-IDF + keywords) | ±0.002 | ✅ (two lines, harmless) |
+| Family-majority labels | ±0.006 | ❌ no measurable gain |
+| Drop 57 broken training rows | ±0.004 | ❌ no measurable gain |
+| Short-ticket augmentation for TF-IDF | +0.003 on full tickets, −0.005 on short | ❌ no gain, and doubles TF-IDF training time |
+| FAISS → NumPy neighbour search | Same results. Fixes a segfault/hang on macOS when FAISS loads after PyTorch | ✅ |

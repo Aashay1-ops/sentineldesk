@@ -52,7 +52,8 @@ data/index/
 *.npz
 *.joblib
 *.faiss
-sentineldesk_artifacts*.zip
+# model / data bundles (.zip) are shared via Drive, never committed
+*.zip
 
 # Results: commit metrics JSON + plots at the end, never prediction dumps or sample runs
 results/sample_*/

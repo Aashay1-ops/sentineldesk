@@ -1,6 +1,11 @@
 """Model 2: similarity-weighted votes of the top-k most similar `train` tickets (no training).
 
-Uses FAISS IndexFlatIP when installed; otherwise an exact NumPy inner product (same results).
+Exact cosine search with NumPy (embeddings are normalized, so inner product = cosine).
+
+Deliberately NOT FAISS: on macOS, FAISS and PyTorch ship separate OpenMP runtimes. Importing FAISS
+after the embedding model has run segfaults (MPS) or hangs forever (CPU), so the demo would work or
+crash depending on which module loaded first. Exact NumPy search gives identical results and takes
+a few milliseconds per ticket for ~20k rows.
 """
 from __future__ import annotations
 
@@ -21,25 +26,20 @@ class NeighbourIndex:
         self.id_set = set(self.ids)
         self.codes, self.labels = codes, labels
         self.k, self.p, self.alpha = k, p, alpha
-        try:
-            import faiss
-
-            self.index = faiss.IndexFlatIP(self.emb.shape[1])
-            self.index.add(self.emb)
-        except ImportError:
-            log.info("faiss not installed: using NumPy exact search")
-            self.index = None
 
     def _search(self, Q: np.ndarray, kk: int) -> tuple[np.ndarray, np.ndarray]:
         kk = min(kk, len(self.ids))
         Q = np.ascontiguousarray(Q, dtype=np.float32)
-        if self.index is not None:
-            return self.index.search(Q, kk)
-        S = Q @ self.emb.T
-        I = np.argpartition(-S, kk - 1, axis=1)[:, :kk]
-        Ssub = np.take_along_axis(S, I, axis=1)
-        order = np.argsort(-Ssub, axis=1)
-        return np.take_along_axis(Ssub, order, axis=1), np.take_along_axis(I, order, axis=1)
+        S_all = np.empty((len(Q), kk), dtype=np.float32)
+        I_all = np.empty((len(Q), kk), dtype=np.int64)
+        for s in range(0, len(Q), 512):  # chunked so a 5k-ticket batch never builds a 5k x 20k matrix at once
+            S = Q[s:s + 512] @ self.emb.T
+            I = np.argpartition(-S, kk - 1, axis=1)[:, :kk]
+            Ssub = np.take_along_axis(S, I, axis=1)
+            order = np.argsort(-Ssub, axis=1, kind="stable")
+            S_all[s:s + 512] = np.take_along_axis(Ssub, order, axis=1)
+            I_all[s:s + 512] = np.take_along_axis(I, order, axis=1)
+        return S_all, I_all
 
     def search(self, Q: np.ndarray, query_ids: list[str] | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Top-k (sims, idx) per query, with each query's own ticket removed if it is in the index."""

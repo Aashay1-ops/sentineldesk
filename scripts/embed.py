@@ -5,8 +5,9 @@ Full run (team model, no --sample) also writes the team's SHARED index (README "
   data/index/kb.pkl   same row order: ticket_id, text, subject, answer, language, type, queue, priority,
                       tag_1..tag_8, searchable
   data/index/meta.json  model + prefix, so retrieval can check it embeds queries the same way
-Triage's per-part arrays (train / half_a / half_b) are sliced from that same matrix; the holdout
-(test_inputs) is embedded separately and never enters the index.
+Triage saves the same matrix as artifacts/embeddings/<model>/kb.npy (train_triage.py cuts the
+family-based train / half_a / half_b from it); the holdout (test_inputs) is embedded separately and
+never enters the index.
 """
 import json
 import time
@@ -21,7 +22,6 @@ from sentineldesk.triage.embed import Embedder
 from sentineldesk.triage.text import build_texts
 from split import load_split
 
-PARTS = ("train", "half_a", "half_b")
 
 
 def save_part(out, part, X, ids):
@@ -44,29 +44,26 @@ def main() -> None:
     emb = Embedder(model, prefix, args.batch_size or cfg["embedding"]["batch_size"], cfg["embedding"]["max_seq_length"])
     out = root / "embeddings" / model_slug(model)
     out.mkdir(parents=True, exist_ok=True)
-    parts = {k: read_part(root / "splits", k) for k in (*PARTS, "test_inputs")}
-    test_ids = parts["test_inputs"]["ticket_id"]
+    kb_part = read_part(root / "splits", "kb")
+    test_in = read_part(root / "splits", "test_inputs")
+    test_ids = test_in["ticket_id"]
+    assert_no_test_ids(kb_part["ticket_id"], test_ids)
 
-    if args.sample:  # quick run: embed the sampled parts directly, never touch the shared index
-        for part in PARTS:
-            df = parts[part]
-            save_part(out, part, emb.encode(build_texts(df["subject"], df["body"]), show_progress=True), df["ticket_id"])
+    if args.sample:  # quick run: embed the sampled kb directly, never touch the shared index
+        X = emb.encode(build_texts(kb_part["subject"], kb_part["body"]), show_progress=True)
+        save_part(out, "kb", X, kb_part["ticket_id"])
     else:
         kb, _ = load_split(str(ensure_csv(cfg["data"].get("csv_path"))))
         kb = kb.reset_index(drop=True)
+        if kb["ticket_id"].tolist() != kb_part["ticket_id"].tolist():
+            raise AssertionError("artifacts/splits/kb.parquet does not match load_split(); re-run scripts/build_split.py")
         texts = build_texts(kb["subject"], kb["body"])
         if texts != kb["text"].tolist():
             raise AssertionError("build_text no longer matches split.py's `text` column; the shared index would drift")
-        part_ids = {k: parts[k]["ticket_id"].tolist() for k in PARTS}
-        if set(kb["ticket_id"]) != set().union(*part_ids.values()):
-            raise AssertionError("artifacts/splits does not match load_split(); re-run scripts/build_split.py")
-        assert_no_test_ids(kb["ticket_id"], test_ids)
         t0 = time.perf_counter()
         E = emb.encode(texts, show_progress=True)
         print(f"kb: {E.shape} in {time.perf_counter() - t0:.1f}s")
-        row = {tid: i for i, tid in enumerate(kb["ticket_id"])}
-        for part in PARTS:
-            save_part(out, part, E[[row[t] for t in part_ids[part]]], part_ids[part])
+        save_part(out, "kb", E, kb["ticket_id"])
         if model == team_model:
             idx_dir = REPO_ROOT / cfg["paths"].get("index_dir", "data/index")
             idx_dir.mkdir(parents=True, exist_ok=True)
@@ -80,7 +77,7 @@ def main() -> None:
         else:
             print(f"NOT writing data/index: {model} is not the team model ({team_model})")
 
-    df = parts["test_inputs"]
+    df = test_in
     t0 = time.perf_counter()
     save_part(out, "test_inputs", emb.encode(build_texts(df["subject"], df["body"]), show_progress=True), test_ids)
     print(f"test_inputs embedded in {time.perf_counter() - t0:.1f}s (holdout: never part of the index)")

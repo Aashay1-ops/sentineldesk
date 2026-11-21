@@ -7,13 +7,13 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from sentineldesk.triage.text import normalize
+from sentineldesk.triage.text import clean_for_features, normalize
 
 _APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "ʼ": "'", "`": "'"})
 
 
 def _canon(text: str) -> str:
-    return normalize(text).translate(_APOSTROPHES).lower()
+    return normalize(clean_for_features(text)).translate(_APOSTROPHES).lower()
 
 
 class KeywordMatcher:

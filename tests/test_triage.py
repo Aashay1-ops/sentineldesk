@@ -70,7 +70,17 @@ def csv_path(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def parts(csv_path):
-    return build_parts(csv_path)
+    """Team split (kb / test), then the family-based train / half_a / half_b, as train_triage.py does."""
+    from sentineldesk.triage.data import family_calib_split
+
+    base = build_parts(csv_path)
+    kb = base["kb"].reset_index(drop=True)
+    emb = FakeEmbedder()
+    E = emb.encode(build_texts(kb["subject"], kb["body"]))
+    pos, fam = family_calib_split(kb, E, 0.98)
+    out = {k: kb.iloc[v].reset_index(drop=True) for k, v in pos.items()}
+    out.update(kb=kb, test=base["test"], _embs={k: E[v] for k, v in pos.items()}, _fam=fam, _pos=pos)
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -79,11 +89,10 @@ def trained(tmp_path_factory, parts):
     cfg = load_config()
     cfg["model_tfidf"]["use_char"] = False
     emb = FakeEmbedder()
-    embs = {k: emb.encode(build_texts(parts[k]["subject"], parts[k]["body"])) for k in ("train", "half_a", "half_b")}
     meta = {"embedding_model": "fake", "prefix": "", "dim": 128}
-    train_all(cfg, {k: parts[k] for k in embs}, embs, root / "triage", meta,
+    train_all(cfg, {k: parts[k] for k in ("train", "half_a", "half_b")}, parts["_embs"], root / "triage", meta,
               test_ids=parts["test"]["ticket_id"].tolist())
-    write_parts(parts, root / "splits")
+    write_parts({"kb": parts["kb"], "test": parts["test"]}, root / "splits")
     return root, emb
 
 
@@ -127,9 +136,9 @@ def test_searchable_flag():
 # ---------- split / leakage ---------------------------------------------------------------------
 def test_split_reproducible_disjoint_and_complete(parts, csv_path):
     again = build_parts(csv_path)
-    for k in parts:
+    for k in ("kb", "test"):
         assert parts[k]["ticket_id"].tolist() == again[k]["ticket_id"].tolist()
-    all_ids = [i for p in parts.values() for i in p["ticket_id"]]
+    all_ids = [i for k in ("train", "half_a", "half_b", "test") for i in parts[k]["ticket_id"]]
     assert len(all_ids) == len(set(all_ids)) == 900
     assert "answer" not in parts["test"].columns
 
@@ -139,8 +148,26 @@ def test_parts_follow_team_split(parts, csv_path):
 
     kb, test = load_split(str(csv_path))
     assert parts["test"]["ticket_id"].tolist() == test["ticket_id"].tolist()
+    assert parts["kb"]["ticket_id"].tolist() == kb["ticket_id"].tolist()
     triage_kb = set().union(*(parts[k]["ticket_id"] for k in ("train", "half_a", "half_b")))
     assert triage_kb == set(kb["ticket_id"])
+
+
+def test_family_split_keeps_reworded_copies_together():
+    """Audit items 3 + 4: no paraphrase family may span train and the calibration halves."""
+    from sentineldesk.triage.data import family_calib_split, paraphrase_families
+
+    rng = np.random.default_rng(0)
+    base = rng.normal(size=(150, 16))
+    E = np.repeat(base, 4, axis=0) + rng.normal(scale=1e-3, size=(600, 16))  # 150 families x 4 copies
+    E = (E / np.linalg.norm(E, axis=1, keepdims=True)).astype(np.float32)
+    fam = paraphrase_families(E, 0.98)
+    assert len(set(fam)) == 150
+    pos, fam2 = family_calib_split(pd.DataFrame({"ticket_id": range(600)}), E, 0.98)
+    assert sorted(np.concatenate(list(pos.values()))) == list(range(600))
+    for a, b in (("train", "half_a"), ("train", "half_b"), ("half_a", "half_b")):
+        assert not set(fam2[pos[a]]) & set(fam2[pos[b]])
+    assert len(pos["half_a"]) > 0 and len(pos["half_b"]) > 0
 
 
 def test_assert_disjoint_catches_leak():
@@ -198,6 +225,13 @@ def test_keyword_matching():
     assert kw.matches("I can’t access email")[0] == ["can't access"]
 
 
+def test_feature_cleaning_literal_newlines_and_br():
+    from sentineldesk.triage.text import clean_for_features
+
+    assert clean_for_features("Hi\\nserver<br>down<BR/>now") == "Hi\nserver\ndown\nnow"
+    assert KeywordMatcher(["down"]).matches("server\\ndown")[0] == ["down"]   # literal \n no longer glues words
+
+
 def test_keyword_yaml_loads():
     kw = KeywordMatcher.from_yaml(REPO_ROOT / "keywords" / "outage_keywords.yaml")
     assert "ausfall" in kw.keywords and "outage" in kw.keywords
@@ -223,6 +257,10 @@ def test_predict_full(trained):
     t = load_triage(root, emb)
     labels = load_labels(root / "triage" / "labels.json")
     assert t.mode == "full"
+    calib = json.loads((root / "triage" / "calibration.json").read_text())
+    for task in TASKS:
+        w = calib["full"][task]["pool_weights_m0_m1_m2"]
+        assert len(w) == 3 and math.isclose(sum(w), 1.0, abs_tol=1e-6)
     en = t.predict("Server outage", "Our EMR system is down for all users")
     _check_output(en, labels)
     assert "emr" in en["critical"]["keyword_hits"]
@@ -251,3 +289,42 @@ def test_temperature_scaling_does_not_hurt_nll(trained):
     for mode in ("fallback", "full"):
         for t in TASKS:
             assert calib[mode][t]["nll_after"] <= calib[mode][t]["nll_before"] + 1e-9
+
+
+def test_neighbours_never_import_faiss():
+    """FAISS + PyTorch on macOS: segfault/hang when FAISS loads after the embedder. Keep it out."""
+    import subprocess
+
+    code = ("import sys, numpy as np; sys.path.insert(0, %r)\n"
+            "from sentineldesk.triage.neighbours import NeighbourIndex\n"
+            "e = np.eye(4, dtype=np.float32); nn = NeighbourIndex(e, list('abcd'), {t: np.zeros(4, int) for t in "
+            "('type','queue','priority')}, {t: ['x'] for t in ('type','queue','priority')}, k=2)\n"
+            "nn.search(e, list('abcd')); assert 'faiss' not in sys.modules, 'faiss was imported'") % str(REPO_ROOT)
+    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
+@pytest.mark.parametrize("method", ["pool", "stack"])
+def test_ensemble_methods(method):
+    from sentineldesk.triage.ensemble import Ensemble
+
+    rng = np.random.default_rng(0)
+    labels = {t: ["a", "b", "c"] for t in TASKS}
+    y = {t: rng.integers(3, size=200) for t in TASKS}
+
+    def noisy(acc):  # a model whose top class is the true label with probability acc, else a wrong one
+        out = {}
+        for t in TASKS:
+            right = rng.random(200) < acc
+            top = np.where(right, y[t], (y[t] + rng.integers(1, 3, size=200)) % 3)
+            p = np.full((200, 3), 0.15)
+            p[np.arange(200), top] = 0.7
+            out[t] = p
+        return out
+
+    ps = [noisy(0.4), noisy(0.8), noisy(0.5)]
+    ens = Ensemble(method=method).fit(ps, y, labels)
+    pr = ens.predict_proba(ps, labels)
+    for t in TASKS:
+        assert pr[t].shape == (200, 3) and np.allclose(pr[t].sum(1), 1)
+        if method == "pool":
+            assert max(range(3), key=lambda i: ens.weights[t][i]) == 1   # trusts the best model most

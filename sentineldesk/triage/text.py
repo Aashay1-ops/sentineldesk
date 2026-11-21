@@ -8,7 +8,10 @@ embedded from the same string or they silently stop matching the index. Unicode 
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
+
+_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
 
 def _clean(x) -> str:
@@ -27,6 +30,12 @@ def build_text(subject, body) -> str:
     if not (s.strip() or b.strip()):
         raise ValueError("Ticket has no subject and no body")
     return s + "\n" + b
+
+
+def clean_for_features(text: str) -> str:
+    """Literal "\\n" escapes and <br> tags -> real line breaks (docs/DATA_PREPROCESSING.md, item 6).
+    Used for TF-IDF and keyword matching only; the embedding text stays identical to split.py's `text`."""
+    return _BR.sub("\n", text.replace("\\n", "\n"))
 
 
 def build_texts(subjects, bodies) -> list[str]:
