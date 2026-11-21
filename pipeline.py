@@ -7,9 +7,9 @@
 Order (README "Pipeline order"): mask PII -> detect language -> triage -> search -> gate ->
 draft (LLM) -> verify -> final gate. Pre-draft escalations skip the LLM call.
 
-The drafter is pluggable until the LLM is chosen:
+The drafter defaults to sentineldesk.draft.draft (Gemini; needs GEMINI_API_KEY). Any drafter:
     drafter(ticket_text, hits, lang) -> {"reply": str, "cited_ids": [str], "unsupported_asks": [str]}
-Without one, safe tickets come back as DRAFT_PENDING.
+    raising DraftError -> escalate "drafting unavailable". Pipeline(drafter=None) -> safe tickets are DRAFT_PENDING.
 
   python pipeline.py                  # self-check on demo tickets
   python pipeline.py "subject" "body" # one ticket, printed as JSON
@@ -22,16 +22,20 @@ import time
 
 from pii import mask
 from retrieve import SIGMA, Retriever, top_similarity
+from sentineldesk.draft import DraftError, draft as gemini_draft
 from sentineldesk.language import detect_language
 from sentineldesk.triage.predict import Triage
-from sentineldesk.triage.text import build_text
+from sentineldesk.triage.text import _clean, build_text
 
-try:  # PR #5 (verify step); the pipeline runs without it until it merges
+try:  # PR #5 (verify step). Without it no draft is ever shown: safe tickets escalate (CLAUDE.md rule)
     from sentineldesk.verify import verify
 except ImportError:
     verify = None
 
 ESCALATE, READY, PENDING = "ESCALATE", "AUTO_DRAFT_READY", "DRAFT_PENDING"
+# ponytail: training tickets are <= ~1.5k chars; longer input is cut so triage, search and Gemini
+# all see the same bounded text. Upgrade path: chunk + summarize if real tickets run long.
+MAX_FIELD_CHARS = 4000
 # ponytail: low queue confidence alone doesn't escalate (queue F1 ~0.5 would send most tickets to a
 # human); it is shown as "routing uncertain" with the top-2 queues. Gate owner may tighten this.
 ESCALATE_ON_LOW_CONF = ("type", "priority")
@@ -54,18 +58,30 @@ def gate(tri: dict, hits: list, draft: dict | None = None, checked: dict | None 
     if sim < SIGMA:
         reasons.append(f"No historical precedent: best similarity {sim:.3f} < {SIGMA}")
     if draft and draft.get("unsupported_asks"):
-        reasons.append("Unsupported request: " + "; ".join(draft["unsupported_asks"][:3]))
+        reasons.append("Unsupported request: " + "; ".join(map(str, draft["unsupported_asks"][:3])))
     if checked and not checked["passed"]:
-        reasons.append("Draft failed verification: " + "; ".join(map(str, checked["failures"][:3])))
+        fails = [f for f in checked["failures"] if f.get("code") != "UNSUPPORTED_ASK"]  # already reported above
+        if fails:
+            reasons.append("Draft failed verification: " + "; ".join(
+                f"{f.get('check')}: {f.get('detail')}" for f in fails[:3]))
     return reasons
 
 
+def _valid_draft(d) -> bool:
+    return (isinstance(d, dict) and isinstance(d.get("reply"), str) and d["reply"].strip() != ""
+            and isinstance(d.get("cited_ids"), list) and isinstance(d.get("unsupported_asks"), list))
+
+
 class Pipeline:
-    def __init__(self, artifacts="artifacts", drafter=None):
+    def __init__(self, artifacts="artifacts", drafter=gemini_draft):
         self.triage = Triage.load(artifacts)
         self.retriever = Retriever(embedder=self.triage.embedder)  # one e5-base model in memory
         self.drafter = drafter
-        self.handle("warm-up", "VPN not working")  # first embedding call is ~1 s; pay it at startup
+        self._embed_warm_up()
+
+    def _embed_warm_up(self):  # first embedding call is ~1 s; pay it at startup (no LLM call)
+        self.triage.predict("warm-up", "VPN not working")
+        self.retriever.search("warm-up\nVPN not working", k=1)
 
     def handle(self, subject, body) -> dict:
         lat, t0 = {}, time.perf_counter()
@@ -75,8 +91,16 @@ class Pipeline:
             return time.perf_counter()
 
         t = time.perf_counter()
-        subject, body = mask(subject or ""), mask(body or "")
-        text = build_text(subject, body)  # same text builder as the index (\n, <br>)
+        # _clean first (None/NaN -> "", non-str -> str, literal \n and <br> -> newline), so mask() sees the
+        # final text: a phone number split by a literal "\n" is masked before anything else reads it.
+        subject, body = (mask(_clean(x)[:MAX_FIELD_CHARS]) for x in (subject, body))
+        if not (subject.strip() or body.strip()):
+            return {"status": ESCALATE, "reasons": ["Empty ticket: no subject and no body"], "language": None,
+                    "masked_text": "", "triage": None, "routing_uncertain": None, "queue_top2": [], "critical": None,
+                    "neighbour_votes": {}, "precedents": [], "best_similarity": 0.0, "draft": None,
+                    "verify": None, "verify_available": verify is not None, "triage_mode": None,
+                    "latency_ms": {"total": round((time.perf_counter() - t0) * 1000, 1)}}
+        text = build_text(subject, body)  # same text builder as the index
         lang = detect_language(subject, body)
         t = lap("mask_lang", t)
         tri = self.triage.predict(subject, body)
@@ -87,12 +111,21 @@ class Pipeline:
 
         reasons, draft, checked = gate(tri, hits), None, None
         if not reasons and self.drafter is not None:
-            draft = self.drafter(text, hits, lang)
+            try:
+                draft = self.drafter(text, hits, lang)
+                if not _valid_draft(draft):
+                    raise DraftError(f"malformed draft: {type(draft).__name__}")
+            except Exception as e:  # DraftError, or anything else the LLM path throws: never crash the UI
+                draft, reasons = None, [f"Drafting unavailable: {type(e).__name__}: {e}"]
             t = lap("draft", t)
-            checked = verify(draft, hits, text, lang) if verify else None
-            t = lap("verify", t)
-            reasons = gate(tri, hits, draft, checked)
+            if draft is not None:
+                checked = verify(draft, hits, text, lang) if verify else None
+                t = lap("verify", t)
+                reasons = gate(tri, hits, draft, checked)
+                if checked is None:
+                    reasons.append("Verify step unavailable (PR #5 not merged): draft not shown")
         status = ESCALATE if reasons else (READY if draft else PENDING)
+        shown = draft if status == READY else None  # a draft that failed or wasn't verified is never shown
         lat["total"] = round((time.perf_counter() - t0) * 1000, 1)
 
         q = sorted(tri["queue"]["probs"].items(), key=lambda x: -x[1])[:2]
@@ -109,7 +142,7 @@ class Pipeline:
             "neighbour_votes": tri["neighbours"].get("explanation", {}),
             "precedents": [{**h, "snippet": h["answer"][:240]} for h in hits],
             "best_similarity": top_similarity(hits),
-            "draft": draft,
+            "draft": shown,
             "verify": checked,
             "verify_available": verify is not None,
             "triage_mode": tri["mode"],
@@ -128,7 +161,23 @@ DEMO = [  # (subject, body, must escalate?)
 
 
 def check():
-    p = Pipeline()
+    p = Pipeline(drafter=None)  # deterministic, offline: no LLM call
+    def failing(*_):
+        raise DraftError("no GEMINI_API_KEY")
+    p.drafter = failing
+    out = p.handle("Invoice charged twice", "We were billed twice for the November subscription.")
+    assert out["status"] == ESCALATE and out["draft"] is None, out  # a failed draft never shows
+    safe = ("Passwort zurücksetzen", "Hallo, ich habe mein Passwort vergessen und die Reset-Mail kommt nicht an.")
+    for bad in (lambda *a: "not a dict", lambda *a: 1 / 0,
+                lambda *a: {"reply": "We will refund 500 EUR today", "cited_ids": ["FAKE"], "unsupported_asks": []}):
+        p.drafter = bad  # malformed, crashing, and fabricated drafts: escalate, never shown
+        out = p.handle(*safe)
+        assert out["draft"] is None and (out["status"] == ESCALATE or out["status"] == PENDING), out
+    for s, b in [("", ""), (None, None), ("  ", "\n"), ("", "<br>"), ("x", float("nan"))]:
+        assert p.handle(s, b)["status"] == ESCALATE  # empty tickets never crash
+    assert p.handle("x", 12345)["status"] in (ESCALATE, PENDING)  # non-str input is coerced
+    assert "1234567" not in p.handle("x", "call 0171\\n1234567")["masked_text"]  # mask after \n cleanup
+    p.drafter = None
     for subject, body, must in DEMO:
         out = p.handle(subject, body)
         tri = out["triage"]
@@ -137,7 +186,8 @@ def check():
               f"best_sim={out['best_similarity']:.3f}  {out['latency_ms']['total']}ms")
         for r in out["reasons"]:
             print("   -", r)
-        print("   top precedent:", out["precedents"][0]["ticket_id"], out["precedents"][0]["subject"][:60])
+        if out["precedents"]:
+            print("   top precedent:", out["precedents"][0]["ticket_id"], out["precedents"][0]["subject"][:60])
         assert "@" not in out["masked_text"] and "555" not in out["masked_text"], "PII leaked past mask()"
         if must is True:
             assert out["status"] == ESCALATE, f"should escalate: {subject or body}"
