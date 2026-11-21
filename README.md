@@ -22,7 +22,7 @@ _Last updated 14:15. Update this table in the same commit as your work: change t
 | ✅ Done | Data audit: source choice, missing values, broken rows, reworded copies, label noise | docs/DATA_PREPROCESSING.md | | 11 suggested changes, high priority first |
 | ✅ Done | RAG plan + locked `search()` interface | README.md ([RAG plan](#rag-plan)) | Chirag | **Approved by the team.** Model: multilingual-e5-base, σ = 0.86. Code against `search()` now |
 | ✅ Done | Hybrid retrieval (BM25 + dense + RRF) | retrieve.py | Chirag | `from retrieve import search`. Self-check: `python retrieve.py check`. Needs the shared index from `python scripts/embed.py`. σ = 0.86. See [Retrieval results](#retrieval-results) |
-| ✅ Done | Triage: critical detector → TF-IDF model → neighbour votes → ensemble + calibration | sentineldesk/triage/, scripts/*_triage.py | SPGOHIL09 | `Triage.load("artifacts").predict(subject, body)`; see sentineldesk/triage/README.md. Trains on Colab via notebooks/triage_colab.ipynb (~10 min on T4), which also builds the shared `data/index/` (e5-base). Falls back to model 0 + critical detector if ensemble files are missing |
+| ✅ Done | Triage: critical detector → TF-IDF model → neighbour votes → ensemble + calibration | sentineldesk/triage/, scripts/*_triage.py | SPGOHIL09 | `Triage.load("artifacts").predict(subject, body)`; see sentineldesk/triage/README.md. Trains in ~6 min on a laptop (or Colab: notebooks/triage_colab.ipynb) and builds the shared `data/index/` (e5-base). Applied the data audit: family-based half A/B, `\n`/`<br>` cleaning, known vs novel holdout slices; ensemble = weighted average (beat the LogReg combiner). Neighbour search uses NumPy, **not FAISS**: FAISS loaded after PyTorch segfaults/hangs on macOS |
 | ⬜ To do | Escalation gate (rules + reason strings) | | | Needs triage + retrieval outputs |
 | ✅ Done | Draft (step ④: LLM writes the reply from retrieved answers, JSON output) | sentineldesk/draft.py | Chirag | `draft(ticket_text, hits, lang)` → `{reply, cited_ids, unsupported_asks, model, latency_ms}`; raises `DraftError` (→ escalate "drafting unavailable"). Feeds straight into `verify()`. Live test: 5/5 normal en/de tickets pass verify in ~1.5 s, 2/2 refund/prompt-injection attacks escalate. Needs `GEMINI_API_KEY` |
 | 🔨 In progress | Verify (step ⑤: rule checks on every LLM draft; fails → escalate) | | Aashay | PR #5 open, not merged yet |
@@ -110,7 +110,7 @@ We use classical ML where results must be measurable, rules where we can't affor
    │    (0) multilingual embeddings → LogReg ×3
    │    (1) TF-IDF (word + character n-grams) → LogReg ×3
    │    (2) neighbour votes: labels of the top-20 most similar past tickets
-   ├─ (6) Ensemble: small LogReg combines (0) + (1) + (2) → calibrated confidence
+   ├─ (6) Ensemble: weighted average of (0) + (1) + (2) log-probs (3 weights/task, fit on half A) → calibrated confidence
    └─ (5) Critical detector: embeddings + outage-keyword flag (en + de)
           → score = how likely this is a high-priority Incident
           → feeds the gate; it does NOT overwrite the predicted labels
@@ -163,7 +163,7 @@ We keep the original idea (embeddings + logistic regression) as the base and add
 | 0 | Embeddings + LogReg (original idea) | Understands meaning, works across German and English |
 | 1 | TF-IDF + LogReg | Catches exact words: product names, error codes |
 | 2 | Neighbour votes | "8 of 10 similar tickets went to Billing": no training needed, and gives an explanation for the UI |
-| 6 | Ensemble + calibration | Combines 0, 1 and 2; models check each other, so confidence is more honest |
+| 6 | Ensemble + calibration | Combines 0, 1 and 2 with 3 weights per task picked on half A (a weighted average of log-probabilities; it beat the planned small LogReg by +5 points mean Macro-F1 on new tickets), then temperature scaling on half B |
 | 5 | Critical detector | Targets high-priority Incident recall with a threshold we can set; replaces the old keyword overrides |
 
 **At prediction time:** the ticket is embedded once and turned into TF-IDF once. Models 0, 1 and 2 each give probabilities, and the ensemble (6) turns them into one calibrated answer per task. The critical detector (5) gives a separate score. In the gate:
@@ -174,7 +174,7 @@ We keep the original idea (embeddings + logistic regression) as the base and add
 
 ### Training, in order
 
-1. **Split the 80% data:** 90% training part, 10% calibration slice. Cut the slice into two halves, **A** and **B** (about 1,100 tickets each). Use `random_state=42` everywhere.
+1. **Split the 80% data:** 90% training part, 10% calibration slice. Cut the slice into two halves, **A** and **B** (about 1,200 tickets each). Use `random_state=42` everywhere. **Draw them by paraphrase family** (tickets with embedding cosine ≥ 0.98 are reworded copies): no half-A / half-B ticket has a copy in the training part, so calibration and thresholds are tuned on tickets that look new (`docs/DATA_PREPROCESSING.md` items 3–4).
 2. **Compute embeddings once** for the whole 80% split and save them. Retrieval, model 0, neighbour votes and the critical detector all reuse them.
 3. **Train models 0 and 1 on the training part.** Neighbour votes (2) need no training; they search the training part.
 4. **Train the ensemble (6) on half A,** using the outputs of models 0, 1 and 2 on half-A tickets.
@@ -185,7 +185,7 @@ We keep the original idea (embeddings + logistic regression) as the base and add
 ### Two mistakes to avoid
 
 - **Don't train the ensemble on the training part.** Models 0 and 1 have already seen those tickets and would look over-confident.
-- **Don't let a ticket vote for itself.** For half-A tickets, neighbour votes search only the training part. Add a check that a ticket never appears in its own neighbour list.
+- **Don't let a ticket vote for itself.** For half-A tickets, neighbour votes search only the training part. Add a check that a ticket never appears in its own neighbour list. Its reworded copies must not vote either: the family-based split guarantees none of them is in the training part.
 
 ### Build order and fallback
 
@@ -354,9 +354,9 @@ Retrieval and the classifier share one file. `scripts/build_split.py` then `scri
 | Data source | main CSV only / main + deduplicated 20k | | ✅ main CSV only (`aa_dataset-tickets-multi-lang-5-2-50-version.csv`). The 20k file repeats 8,395 of its tickets with 99.7–99.9% identical labels; the German file is a different domain without `type` / `answer`. See `docs/DATA_PREPROCESSING.md` |
 | LLM for drafting | Gemini (check the hackathon benefits page) / other | Chirag | ✅ `gemini-2.5-flash` with thinking off (~1–2 s), fallback `gemini-3.1-flash-lite` (~1 s), one 2 s retry on HTTP 429. Called over REST with the standard library (no SDK). Measured 21 Nov: gemini-3.5/3.8-flash took 24 s+ or timed out, gemini-2.5-flash-lite returns 404 for new keys. 2.5-flash rate-limited after ~15 calls in a few minutes: **don't hammer it while rehearsing**. Override with `GEMINI_MODEL` |
 | Embedding model | multilingual-e5 / bge-m3 / TF-IDF | | ✅ `intfloat/multilingual-e5-base` (768 dims, `query: ` prefix on both sides). Probe on the 80% split: e5-base found the original from a translated ticket 60% of the time in the top 5, vs 37% for e5-small. Same-language quality was equal, both separate off-topic queries perfectly, and queries take ~12 ms. bge-m3 was not tested (download kept timing out); optional upgrade if there's time |
-| Classifier | embeddings + logistic regression / TF-IDF / neighbour votes / ensemble / fine-tuned transformer | | ✅ ensemble of (0) embeddings + LogReg, (1) TF-IDF + LogReg and (2) neighbour votes, combined and calibrated by (6); (5) critical detector replaces the keyword overrides. See [Triage in detail](#triage-in-detail-options-0-1-2-5-6) |
+| Classifier | embeddings + logistic regression / TF-IDF / neighbour votes / ensemble / fine-tuned transformer | | ✅ ensemble of (0) embeddings + LogReg, (1) TF-IDF + LogReg and (2) neighbour votes, combined by (6) (weighted average of log-probs, weights fit on half A; updated after the data audit: it beat the LogReg combiner by +5 points mean Macro-F1 on new tickets) and calibrated on half B; (5) critical detector replaces the keyword overrides. See [Triage in detail](#triage-in-detail-options-0-1-2-5-6) |
 | Retrieval | dense only / hybrid | | ✅ hybrid: BM25 + dense, fused with RRF |
-| Vector store | FAISS / Chroma / numpy | | |
+| Vector store | FAISS / Chroma / numpy | | Triage uses **numpy** (exact search, ~ms for 23k rows). ⚠️ Avoid FAISS on macOS: imported after PyTorch has run, it segfaults (GPU) or hangs (CPU) |
 | UI | Streamlit / Gradio / other | | |
 | What happens after "Escalate" | | | |
 | What the AI draft must contain | | | |

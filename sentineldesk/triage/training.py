@@ -1,7 +1,7 @@
 """Train every triage piece in the agreed order and save artifacts.
 
 train  -> model 0, model 1, critical detector, neighbour index
-half A -> ensemble (6)
+half A -> ensemble (6)   (train / half A / half B are cut by paraphrase family: no reworded copies across them)
 half B -> temperature scaling, critical threshold, suggested confidence thresholds
 """
 from __future__ import annotations
@@ -131,13 +131,18 @@ def train_all(cfg: dict, parts: dict[str, pd.DataFrame], embs: dict[str, np.ndar
                 p2[k] = nn.vote(S, I)
 
         with timer("ensemble (6) on half A + temperature on half B"):
-            ens = Ensemble(C=cfg["ensemble"]["C"]).fit([p0["half_a"], p1["half_a"], p2["half_a"]], y["half_a"], labels)
+            ec = cfg["ensemble"]
+            ens = Ensemble(C=ec.get("C", 1.0), method=ec.get("method", "pool"), grid_step=ec.get("grid_step", 0.1)
+                           ).fit([p0["half_a"], p1["half_a"], p2["half_a"]], y["half_a"], labels)
             joblib.dump(ens, out_dir / "ensemble.joblib")
             pe = ens.predict_proba([p0["half_b"], p1["half_b"], p2["half_b"]], labels)
             for t in TASKS:
                 T = fit_temperature(pe[t], y["half_b"][t])
                 calib["full"][t] = _calib_report(pe[t], y["half_b"][t], T, bins, min_bin)
                 thresholds["full"][t] = calib["full"][t]["suggested_conf_threshold"]
+                calib["full"][t]["ensemble_method"] = ens.method
+                if ens.method == "pool":
+                    calib["full"][t]["pool_weights_m0_m1_m2"] = list(ens.weights[t])
 
     (out_dir / "calibration.json").write_text(json.dumps(calib, indent=2))
     (out_dir / "thresholds.json").write_text(json.dumps(thresholds, indent=2))

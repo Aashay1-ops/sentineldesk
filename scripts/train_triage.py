@@ -1,5 +1,8 @@
-"""Train models 0, 1, 5; build the neighbour index (2); train the ensemble (6) on half A;
-calibrate and tune thresholds on half B. Never touches holdout labels."""
+"""Train models 0, 1, 5; build the neighbour index (2); fit the ensemble (6) on half A;
+calibrate and tune thresholds on half B. Never touches holdout labels.
+
+train / half_a / half_b come from scripts/embed.py, which redraws them BY PARAPHRASE FAMILY
+(data audit #3/#4): no half-A / half-B ticket has a reworded copy in train."""
 import json
 import time
 
@@ -43,8 +46,9 @@ def main() -> None:
                         fallback_only=args.fallback_only)
     print(json.dumps({"times_s": summary["times"], "total_s": round(time.perf_counter() - t0, 1),
                       "thresholds": summary["thresholds"],
-                      "half_b": {m: {t: {k: round(v, 4) for k, v in r.items()} for t, r in d.items()}
-                                 for m, d in summary["calibration"].items()}}, indent=2))
+                      "half_b (new tickets: no reworded copy in train)":
+                          {m: {t: {k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}
+                               for t, r in d.items()} for m, d in summary["calibration"].items()}}, indent=2))
 
 
 if __name__ == "__main__":

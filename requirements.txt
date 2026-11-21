@@ -10,6 +10,5 @@ pyyaml>=6.0
 huggingface_hub>=0.24
 sentence-transformers>=3.0
 torch>=2.2            # Colab: keep the preinstalled CUDA build (pip leaves it alone)
-faiss-cpu>=1.8        # optional at runtime: neighbours.py falls back to exact NumPy search
 matplotlib>=3.8
 pytest>=8.0

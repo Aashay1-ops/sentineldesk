@@ -253,6 +253,10 @@ def test_predict_full(trained):
     t = load_triage(root, emb)
     labels = load_labels(root / "triage" / "labels.json")
     assert t.mode == "full"
+    calib = json.loads((root / "triage" / "calibration.json").read_text())
+    for task in TASKS:
+        w = calib["full"][task]["pool_weights_m0_m1_m2"]
+        assert len(w) == 3 and math.isclose(sum(w), 1.0, abs_tol=1e-6)
     en = t.predict("Server outage", "Our EMR system is down for all users")
     _check_output(en, labels)
     assert "emr" in en["critical"]["keyword_hits"]
@@ -281,3 +285,42 @@ def test_temperature_scaling_does_not_hurt_nll(trained):
     for mode in ("fallback", "full"):
         for t in TASKS:
             assert calib[mode][t]["nll_after"] <= calib[mode][t]["nll_before"] + 1e-9
+
+
+def test_neighbours_never_import_faiss():
+    """FAISS + PyTorch on macOS: segfault/hang when FAISS loads after the embedder. Keep it out."""
+    import subprocess
+
+    code = ("import sys, numpy as np; sys.path.insert(0, %r)\n"
+            "from sentineldesk.triage.neighbours import NeighbourIndex\n"
+            "e = np.eye(4, dtype=np.float32); nn = NeighbourIndex(e, list('abcd'), {t: np.zeros(4, int) for t in "
+            "('type','queue','priority')}, {t: ['x'] for t in ('type','queue','priority')}, k=2)\n"
+            "nn.search(e, list('abcd')); assert 'faiss' not in sys.modules, 'faiss was imported'") % str(REPO_ROOT)
+    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
+@pytest.mark.parametrize("method", ["pool", "stack"])
+def test_ensemble_methods(method):
+    from sentineldesk.triage.ensemble import Ensemble
+
+    rng = np.random.default_rng(0)
+    labels = {t: ["a", "b", "c"] for t in TASKS}
+    y = {t: rng.integers(3, size=200) for t in TASKS}
+
+    def noisy(acc):  # a model whose top class is the true label with probability acc, else a wrong one
+        out = {}
+        for t in TASKS:
+            right = rng.random(200) < acc
+            top = np.where(right, y[t], (y[t] + rng.integers(1, 3, size=200)) % 3)
+            p = np.full((200, 3), 0.15)
+            p[np.arange(200), top] = 0.7
+            out[t] = p
+        return out
+
+    ps = [noisy(0.4), noisy(0.8), noisy(0.5)]
+    ens = Ensemble(method=method).fit(ps, y, labels)
+    pr = ens.predict_proba(ps, labels)
+    for t in TASKS:
+        assert pr[t].shape == (200, 3) and np.allclose(pr[t].sum(1), 1)
+        if method == "pool":
+            assert max(range(3), key=lambda i: ens.weights[t][i]) == 1   # trusts the best model most

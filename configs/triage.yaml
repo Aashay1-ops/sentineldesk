@@ -36,8 +36,10 @@ neighbours:                # model 2
   alpha: 0.1
   top_n_display: 5
 
-ensemble:                  # model 6
-  C: 1.0
+ensemble:                  # model 6, fitted on half A
+  method: pool             # pool = weighted average of log-probs (3 weights/task); stack = LR (original plan)
+  grid_step: 0.1           # pool weight grid
+  C: 1.0                   # stack only
 
 calibration:
   ece_bins: 15
