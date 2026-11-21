@@ -10,7 +10,7 @@ SentinelDesk takes an incoming support ticket (English or German) and:
 
 ## Status board
 
-_Last updated 12:00. Update this table in the same commit as your work: change the status, add your name. Run `python check_rules.py` before every push._
+_Last updated 14:15. Update this table in the same commit as your work: change the status, add your name. Run `python check_rules.py` before every push._
 
 | Status | Piece | File | Owner | Notes |
 |---|---|---|---|---|
@@ -20,12 +20,13 @@ _Last updated 12:00. Update this table in the same commit as your work: change t
 | ✅ Done | PII masking (bonus) | pii.py | | Self-check: `python pii.py`. Must become step 1 of the pipeline |
 | ✅ Done | Language detection | sentineldesk/language.py | Hung | ~0.02 ms/ticket, zero deps. Removed German IT loanwords (`account`, `system`, `error`, `access`, `update`, `support`, `customer`, `team`) from `EN_PROFILE` and cut unused `fr`/`es` profiles |
 | ✅ Done | Data audit: source choice, missing values, broken rows, reworded copies, label noise | docs/DATA_PREPROCESSING.md | | 11 suggested changes, high priority first |
-| ✅ Done | RAG plan + locked `search()` interface | README.md ([RAG plan](#rag-plan)) | Chirag | **Approved by the team.** Model: multilingual-e5-base, σ ≈ 0.87 to start. Code against `search()` now |
-| 🔨 In progress | Hybrid retrieval (BM25 + dense + RRF) | retrieve.py | Chirag | Building to the approved plan; **not pushed yet**. Tag numbers being gathered for the tags-in-text experiment |
+| ✅ Done | RAG plan + locked `search()` interface | README.md ([RAG plan](#rag-plan)) | Chirag | **Approved by the team.** Model: multilingual-e5-base, σ = 0.86. Code against `search()` now |
+| ✅ Done | Hybrid retrieval (BM25 + dense + RRF) | retrieve.py | Chirag | `from retrieve import search`. Self-check: `python retrieve.py check`. Needs the shared index from `python scripts/embed.py`. σ = 0.86. See [Retrieval results](#retrieval-results) |
 | ✅ Done | Triage: critical detector → TF-IDF model → neighbour votes → ensemble + calibration | sentineldesk/triage/, scripts/*_triage.py | SPGOHIL09 | `Triage.load("artifacts").predict(subject, body)`; see sentineldesk/triage/README.md. Trains in ~6 min on a laptop (or Colab: notebooks/triage_colab.ipynb) and builds the shared `data/index/` (e5-base). Applied the data audit: family-based half A/B, `\n`/`<br>` cleaning, known vs novel holdout slices; ensemble = weighted average (beat the LogReg combiner). Neighbour search uses NumPy, **not FAISS**: FAISS loaded after PyTorch segfaults/hangs on macOS |
 | ⬜ To do | Escalation gate (rules + reason strings) | | | Needs triage + retrieval outputs |
-| ⬜ To do | Draft (Gemini, JSON output) + verify step | | **unassigned** | Blocked on choosing the LLM. Can start now with mocked retrieval results |
-| ⬜ To do | Live console UI | | **unassigned** | Blocked on choosing the UI framework. Can start now with mocked outputs |
+| ✅ Done | Draft (step ④: LLM writes the reply from retrieved answers, JSON output) | sentineldesk/draft.py | Chirag | `draft(ticket_text, hits, lang)` → `{reply, cited_ids, unsupported_asks, model, latency_ms}`; raises `DraftError` (→ escalate "drafting unavailable"). Feeds straight into `verify()`. Live test: 5/5 normal en/de tickets pass verify in ~1.5 s, 2/2 refund/prompt-injection attacks escalate. Needs `GEMINI_API_KEY` |
+| 🔨 In progress | Verify (step ⑤: rule checks on every LLM draft; fails → escalate) | | Aashay | PR #5 open, not merged yet |
+| 🔨 In progress | Live console UI | | Sudeep | |
 | 🔨 Ready, not run | Eval script: Macro-F1 + high-priority Incident recall, "ML only" vs "ML + rules", latency | scripts/eval_triage.py | SPGOHIL09 | Triage part written and tested on a sample. Run on the holdout **once**, at the end |
 | ✅ Done | requirements.txt | requirements.txt | SPGOHIL09 | scikit-learn pinned to 1.7.2 (models are pickled on Colab, loaded on the laptop) |
 | ⬜ To do | Demo script + rehearsal | | | Last hour |
@@ -225,10 +226,10 @@ These are estimates. Save embeddings and models to Google Drive so a disconnect 
 - ✅ **Soft boost (default).** After searching, move up past tickets whose type/queue matches the prediction, by an amount scaled by the classifier's confidence. A low-confidence guess barely changes anything.
 - ✅ **Same-language boost.** A small boost for past tickets in the query's language. Other-language tickets stay eligible, so a German ticket can still use English precedents (cross-lingual bonus).
 - ✅ **Categories go to the LLM.** Each precedent is passed with its queue/type so the LLM can judge how relevant it is.
-- 🧪 **Experiment:** add tags/categories to the past tickets' searchable text (helps keyword search). Keep it only if it measurably helps.
+- 🧪 **Experiment: tags in keyword search only.** Append each past ticket's frequent tags (the 96 used 50+ times) to its **BM25** text. Embeddings stay on the raw text, so the shared embeddings file doesn't change. It's an on/off switch, kept only if the self-check shows it helps. See [Tag numbers](#tag-numbers). **Result: OFF.** No measurable gain (type@5 0.764 vs 0.763, queue@5 equal, cross-lingual within noise on 30 probes).
 - ❌ **No hard filter by predicted queue.** It would hide the right match about half the time.
 
-**Remove near-duplicate results:** if two of the top 5 have almost identical answers (cosine > 0.95), keep the higher-ranked one and take the next result instead.
+**Remove near-duplicate results:** if two of the top 5 have almost identical answers (text similarity > 0.9, `difflib`), keep the higher-ranked one and take the next result instead. Returned answers go through `pii.normalize_placeholders()`, so `[Name]`/`{tel_num}` become `<name>`/`<tel_num>` before the LLM sees them.
 
 **"No precedent" threshold σ:** if the top result's dense cosine similarity is below σ, escalate. Pick σ on a slice of the 80% split, as the gap between in-domain tickets and off-topic probes (recipes, sports, prompt injection, in en and de). Use one σ for both languages unless the data shows they differ. **σ depends on the embedding model** (e5 scores cluster high, bge-m3 is more spread out), so re-pick it if the model changes.
 
@@ -242,6 +243,24 @@ These are estimates. Save embeddings and models to Google Drive so a disconnect 
 - Search latency p50/p95.
 
 **Handoff to the LLM:** `[{ticket_id, similarity, language, type, queue, answer}]`, top 5.
+
+### Tag numbers
+
+Measured on the 80% split (22,869 tickets):
+
+| Finding | Number | What we do with it |
+|---|---|---|
+| Every ticket has tags | 1–8 per ticket, median 5 | Tags are usable for every past ticket |
+| Tags are English even on German tickets | 1 of ~107k tag uses has an umlaut | Tags give the same English label to tickets in both languages. Mostly helps **English queries find German tickets** through keyword search |
+| Tags add new words | 67% of tags don't appear in the ticket text | Worth testing in keyword search |
+| Long tail | 1,138 distinct tags; 539 used once; 96 used 50+ times; top 30 = 88% of uses | Use only the 96 frequent tags |
+| Predict type | NMI 0.18 | Some help |
+| Predict queue | NMI 0.12 overall, but Billing → Billing queue 99%, Payment 100%, Account 77% | A few tags are near-certain |
+| Predict priority | NMI 0.01–0.03 | No help; escalation stays the safety net |
+| Outage-type tags | Crash: 60% high priority, 69% Incident. Outage: 53% / 71%. Disruption: 48% / 69% (average ticket: 39% / 40%) | **Critical detector:** build the outage keyword list from Outage, Disruption and Crash tickets |
+| Request-type tags | Feature: 10% Incident. Sales: 9% Incident | |
+
+New tickets have **no tags**, so tags are only ever used on the past-ticket side. **UI idea:** show the most common tags among the retrieved past tickets as likely topics (e.g. "Outage · Network"). **Burst detection (bonus):** several recent tickets whose neighbours are tagged Outage or Crash is a strong "major incident" signal.
 
 ### 🔒 Locked interface: `search()`
 
@@ -261,13 +280,14 @@ search(text, k=5, preds=None, lang=None, exclude_ids=None, pool_ids=None)
 | `exclude_ids` | Ticket IDs never to return (a ticket must not find itself) | ML person, neighbour votes only |
 | `pool_ids` | Search only these tickets (for example the 90% training part during calibration) | ML person, neighbour votes only |
 
-- **`similarity`** is the dense cosine similarity, never the RRF score. The gate escalates "no precedent" when the top result has `similarity < σ` (σ ≈ 0.87 for now).
+- **`similarity`** is the dense cosine similarity, never the RRF score. The gate escalates "no precedent" when `retrieve.top_similarity(hits) < retrieve.SIGMA` (σ = 0.86). That's the **highest** similarity among the results, not rank 1's: the boosts can reorder results.
+- **Optional `q`:** pass triage's embedding of the same text (`search(text, ..., q=vec)`) so the query is embedded once.
 - **Neighbour votes** use **dense-only** search (no BM25, no boosts), weighted by `similarity`. Boosting by triage predictions would be circular.
 - **Live demo:** nobody passes `exclude_ids` or `pool_ids`.
 
-### Shared embeddings file (built by the ML person on Colab)
+### Shared embeddings file (built by `python scripts/embed.py`)
 
-Retrieval and the classifier share one file. Build it with **exactly** these settings, or live queries silently stop matching the index:
+Retrieval and the classifier share one file. `scripts/build_split.py` then `scripts/embed.py` (the team model from `configs/triage.yaml`) write it with these settings; `retrieve.py` refuses to load an index whose `meta.json` names a different model. **Rebuild it whenever `split.py`'s `text` column changes**, or live queries won't match the stored text:
 
 - **Model:** `intfloat/multilingual-e5-base`
 - **Text:** the `text` column from `split.py` (`subject + "\n" + body`, missing subject → empty)
@@ -276,8 +296,28 @@ Retrieval and the classifier share one file. Build it with **exactly** these set
 - **Tickets:** all 22,869 from the 80% split (`load_split()[0]`), in that row order
 - **Outputs, in `data/index/`** (gitignored; share them through Drive):
   - `emb.npy`: shape `(22869, 768)`
-  - `kb.pkl`: same row order, with `ticket_id, text, subject, answer, language, type, queue, priority, tag_1..tag_8`, plus `searchable` (False for empty, placeholder-only or under-40-character answers)
+  - `kb.pkl`: same row order, with `ticket_id, text, subject, answer, language, type, queue, priority, tag_1..tag_8`, plus `searchable` (from `sentineldesk/triage/data.py:is_searchable`: False for empty, placeholder-only or under-40-character answers, and for the data audit's broken rows: agent-voice opener, body/answer word Jaccard ≥ 0.60, under 6 words. 22,486 of 22,869 are searchable)
+  - `meta.json`: model + prefix
 - **Run `python check_rules.py` after building.** It verifies the index holds only 80%-split tickets.
+
+### Retrieval results
+
+`python retrieve.py check`, on the 80% split only (300 queries from half A, each excluded from its own results), plus 13 hand-typed tickets and 12 off-topic probes written for the check:
+
+| Check | Result |
+|---|---|
+| Self-retrieval, exclusion, junk filter | ✅ 20/20, never returns excluded or non-searchable tickets |
+| Type / queue match in top 5 (sanity check only) | 0.77 / 0.45 |
+| Cross-lingual: translated ticket finds its original, other-language tickets only | EN→DE 68%, DE→EN 97% (top 5) |
+| Same, in full search | 29% / 13%. Same-language near-duplicates usually rank first; that's fine, they are valid precedents |
+| Top-1 similarity | dataset tickets p50 0.976 · **hand-typed min 0.870, p50 0.886** · **off-topic max 0.853** |
+| σ = 0.86 | all 12 off-topic probes below, 0 of 13 hand-typed below. **The gap is only ~0.01**, so the gate should also use the LLM's out-of-scope flag |
+| Latency | search 6 ms p50 / 9 ms p95; query embedding ~8 ms warm on a Mac (first call ~1 s: warm up at app start) |
+
+**Fixes found while testing:**
+- **Keyword search needs stopwords and half weight.** In this synthetic corpus, filler words like "seit" and "Kontakt" are rare, so BM25 ranked a billing ticket first for a German VPN outage. With en/de stopwords and BM25 at 0.5 weight in RRF, that query returns "VPN Connection Issue" (an English precedent) first. Hybrid still beats dense-only on hand-typed tickets (data export, password reset, laptop boot).
+- **σ must be picked on hand-typed tickets** (data audit #5). Dataset tickets have reworded copies in the KB and score ~0.98, much higher than anything a judge will type.
+- **Known gap:** some topics have no close precedent (for example a German printer ticket matches "several office devices"). The σ gate and the LLM's out-of-scope flag cover this.
 
 ## Required deliverables (from the problem statement)
 
@@ -312,7 +352,7 @@ Retrieval and the classifier share one file. Build it with **exactly** these set
 | Topic | Options | Owner | Decision |
 |---|---|---|---|
 | Data source | main CSV only / main + deduplicated 20k | | ✅ main CSV only (`aa_dataset-tickets-multi-lang-5-2-50-version.csv`). The 20k file repeats 8,395 of its tickets with 99.7–99.9% identical labels; the German file is a different domain without `type` / `answer`. See `docs/DATA_PREPROCESSING.md` |
-| LLM for drafting | Gemini (check the hackathon benefits page) / other | | |
+| LLM for drafting | Gemini (check the hackathon benefits page) / other | Chirag | ✅ `gemini-2.5-flash` with thinking off (~1–2 s), fallback `gemini-3.1-flash-lite` (~1 s), one 2 s retry on HTTP 429. Called over REST with the standard library (no SDK). Measured 21 Nov: gemini-3.5/3.8-flash took 24 s+ or timed out, gemini-2.5-flash-lite returns 404 for new keys. 2.5-flash rate-limited after ~15 calls in a few minutes: **don't hammer it while rehearsing**. Override with `GEMINI_MODEL` |
 | Embedding model | multilingual-e5 / bge-m3 / TF-IDF | | ✅ `intfloat/multilingual-e5-base` (768 dims, `query: ` prefix on both sides). Probe on the 80% split: e5-base found the original from a translated ticket 60% of the time in the top 5, vs 37% for e5-small. Same-language quality was equal, both separate off-topic queries perfectly, and queries take ~12 ms. bge-m3 was not tested (download kept timing out); optional upgrade if there's time |
 | Classifier | embeddings + logistic regression / TF-IDF / neighbour votes / ensemble / fine-tuned transformer | | ✅ ensemble of (0) embeddings + LogReg, (1) TF-IDF + LogReg and (2) neighbour votes, combined by (6) (weighted average of log-probs, weights fit on half A; updated after the data audit: it beat the LogReg combiner by +5 points mean Macro-F1 on new tickets) and calibrated on half B; (5) critical detector replaces the keyword overrides. See [Triage in detail](#triage-in-detail-options-0-1-2-5-6) |
 | Retrieval | dense only / hybrid | | ✅ hybrid: BM25 + dense, fused with RRF |
@@ -320,5 +360,5 @@ Retrieval and the classifier share one file. Build it with **exactly** these set
 | UI | Streamlit / Gradio / other | | |
 | What happens after "Escalate" | | | |
 | What the AI draft must contain | | | |
-| Confidence and similarity thresholds | | | Critical threshold: catch ≥ 90% of high-priority Incidents, tuned on half B. Confidence threshold: tuned on half B. Similarity threshold: start at σ ≈ 0.87 for e5-base (in-domain top-1 median 0.954, highest off-topic probe 0.854); finalize on the full index, on the 80% split |
+| Confidence and similarity thresholds | | | Critical threshold: catch ≥ 90% of high-priority Incidents, tuned on half B. Confidence threshold: tuned on half B. ✅ Similarity threshold: σ = 0.86 for e5-base, between the highest off-topic probe (0.853) and the lowest hand-typed ticket (0.870). See [Retrieval results](#retrieval-results) |
 | Team roles (5 people) | | | |

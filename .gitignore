@@ -38,6 +38,7 @@ data/*.pkl
 data/*.npy
 data/*.faiss
 artifacts/
+results/
 
 # IDE & OS
 .DS_Store

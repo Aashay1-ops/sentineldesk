@@ -1,6 +1,8 @@
-"""Cut train / half_a / half_b from kb BY PARAPHRASE FAMILY, then train models 0, 1, 5, build the
-neighbour index (2), fit the ensemble (6) on half A, calibrate and tune thresholds on half B.
-Never touches holdout labels."""
+"""Train models 0, 1, 5; build the neighbour index (2); fit the ensemble (6) on half A;
+calibrate and tune thresholds on half B. Never touches holdout labels.
+
+train / half_a / half_b come from scripts/embed.py, which redraws them BY PARAPHRASE FAMILY
+(data audit #3/#4): no half-A / half-B ticket has a reworded copy in train."""
 import json
 import time
 
@@ -8,8 +10,15 @@ import numpy as np
 from _common import parser, setup_logging
 
 from sentineldesk.triage.config import artifacts_dir, load_config, model_slug
-from sentineldesk.triage.data import family_calib_split, read_part, write_calib_parts
+from sentineldesk.triage.data import read_part
 from sentineldesk.triage.training import train_all
+
+
+def load_emb(edir, part, df):
+    ids = json.loads((edir / f"{part}_ids.json").read_text())
+    if ids != df["ticket_id"].tolist():
+        raise ValueError(f"Embedding order for {part} does not match the split; re-run scripts/embed.py")
+    return np.load(edir / f"{part}.npy")
 
 
 def main() -> None:
@@ -22,29 +31,15 @@ def main() -> None:
     root = artifacts_dir(cfg, args.artifacts, args.sample)
     model = args.model or cfg["embedding"]["model"]
     edir = root / "embeddings" / model_slug(model)
-    if not (edir / "meta.json").exists() or not (edir / "kb.npy").exists():
+    if not (edir / "meta.json").exists():
         have = sorted(p.name for p in (root / "embeddings").glob("*")) if (root / "embeddings").exists() else []
-        raise SystemExit(f"No kb embeddings for {model} in {edir}.\n"
+        raise SystemExit(f"No embeddings for {model} in {edir}.\n"
                          f"Run first:  python scripts/embed.py --model {model}"
                          + (" --sample " + str(args.sample) if args.sample else "")
                          + f"\nEmbeddings that exist: {have or 'none'}")
-
-    splits = root / "splits"
-    kb = read_part(splits, "kb")
-    ids = json.loads((edir / "kb_ids.json").read_text())
-    if ids != kb["ticket_id"].tolist():
-        raise ValueError("kb embedding order does not match splits/kb.parquet; re-run scripts/embed.py")
-    E = np.load(edir / "kb.npy")
-    threshold = cfg["calibration"].get("family_threshold", 0.98)
-    pos, fam = family_calib_split(kb, E, threshold)
-    write_calib_parts(kb, pos, fam, splits)
-    sizes = {k: len(v) for k, v in pos.items()}
-    print(f"family-based split (cosine >= {threshold}): {sizes}, "
-          f"{int((np.bincount(fam) > 1).sum())} families with reworded copies, 0 shared across parts")
-
-    parts = {k: kb.iloc[v].reset_index(drop=True) for k, v in pos.items()}
-    embs = {k: E[v] for k, v in pos.items()}
-    test_ids = read_part(splits, "test_inputs")["ticket_id"].tolist()  # ids only, for the leakage assert
+    parts = {k: read_part(root / "splits", k) for k in ("train", "half_a", "half_b")}
+    embs = {k: load_emb(edir, k, parts[k]) for k in parts}
+    test_ids = read_part(root / "splits", "test_inputs")["ticket_id"].tolist()  # ids only, for the leakage assert
     embed_meta = json.loads((edir / "meta.json").read_text())
     t0 = time.perf_counter()
     summary = train_all(cfg, parts, embs, root / "triage", embed_meta, test_ids=test_ids,

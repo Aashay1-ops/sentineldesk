@@ -16,7 +16,6 @@ import shutil
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from sentineldesk.triage.config import REPO_ROOT
@@ -31,7 +30,7 @@ DATASET_REPO = "Tobi-Bueck/customer-support-tickets"
 DATASET_FILE = "aa_dataset-tickets-multi-lang-5-2-50-version.csv"
 DEFAULT_CSV = REPO_ROOT / "data" / "tickets.csv"
 SEED = 42
-TRAIN_PARTS = ("train", "half_a", "half_b")  # cut from kb by paraphrase family in train_triage.py
+TRAIN_PARTS = ("train", "half_a", "half_b")
 TEST_INPUT_COLS = ["ticket_id", "subject", "body"]
 TEST_LABEL_COLS = ["ticket_id", "type", "queue", "priority"]
 # Columns kept for training parts. `answer` is kept for the retrieval teammate (kb only).
@@ -77,70 +76,104 @@ KB_INDEX_COLS = ["ticket_id", "text", "subject", "answer", "language", "type", "
     f"tag_{i}" for i in range(1, 9)
 ]
 _PLACEHOLDER = re.compile(r"<[^<>\s]{1,40}>")
+_WORD = re.compile(r"(?u)\b[^\W\d_]{2,}\b")
+# Data audit #7 (docs/DATA_PREPROCESSING.md section 5): a customer body written in the agent's voice.
+_AGENT_OPENER = re.compile(
+    r"(?i)^\s*(?:thank you|thanks for|we appreciate|we apologi[sz]e|we are sorry|we're sorry|"
+    r"vielen dank|danke für|wir entschuldigen|es tut uns leid|wir freuen uns|wir schätzen|wir danken|"
+    r"(?:dear|hello|hi|hallo|sehr geehrte\w*)\s+(?:\[|<|\{)?\s*(?:name|ihr name)\b)")
 
 
-def is_searchable(answer) -> bool:
-    """README rule: False for empty, placeholder-only or under-40-character answers."""
-    if answer is None or (isinstance(answer, float) and math.isnan(answer)):
+def _text(x) -> str:
+    return "" if x is None or (isinstance(x, float) and math.isnan(x)) else str(x)
+
+
+def is_searchable(answer, subject=None, body=None) -> bool:
+    """False for empty, placeholder-only or under-40-character answers (README), and, when subject/body
+    are given, for the audit's broken rows: agent-voice opener, body/answer word Jaccard >= 0.60
+    (copied or echo-only answer), or under 6 words of subject + body.
+    ponytail: the audit's agent-voice classifier is not used (needs a trained model); ~2.5% of
+    broken rows remain per the audit's sample."""
+    a = _text(answer).strip()
+    if len(a) < 40 or not re.search(r"[^\W\d_]", _PLACEHOLDER.sub("", a)):
         return False
-    a = str(answer).strip()
-    return len(a) >= 40 and bool(re.search(r"[^\W\d_]", _PLACEHOLDER.sub("", a)))
+    if body is None:
+        return True
+    s, b = _text(subject), _text(body)
+    if len((s + " " + b).split()) < 6 or _AGENT_OPENER.match(b):
+        return False
+    wa, wb = {w.lower() for w in _WORD.findall(a)}, {w.lower() for w in _WORD.findall(b)}
+    return not (wa and wb and len(wa & wb) / len(wa | wb) >= 0.60)
 
 
 def kb_index_frame(kb: pd.DataFrame) -> pd.DataFrame:
     """Rows for data/index/kb.pkl, in load_split() order, plus the `searchable` flag."""
     out = kb[[c for c in KB_INDEX_COLS if c in kb.columns]].reset_index(drop=True).copy()
-    out["searchable"] = out["answer"].map(is_searchable)
+    body = kb["body"].reset_index(drop=True) if "body" in kb.columns else [None] * len(out)
+    out["searchable"] = [is_searchable(a, s, b) for a, s, b in zip(out["answer"], out["subject"], body)]
     return out
 
 
-def paraphrase_families(emb: np.ndarray, threshold: float = 0.98, chunk: int = 2048) -> np.ndarray:
-    """One family id per row: tickets whose normalized embeddings have cosine >= threshold are linked
-    (connected components). docs/DATA_PREPROCESSING.md, Appendix A; 0.98 re-checked on e5-base: labels
-    agree ~97-100% above it and drop to ~79% (queue) just below."""
+def calib_split(kb: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """kb -> (train, half_a, half_b): 90% / 5% / 5%, seed 42."""
+    calib = kb.sample(frac=0.10, random_state=SEED)
+    train = kb.drop(calib.index)
+    half_a = calib.sample(frac=0.5, random_state=SEED)
+    half_b = calib.drop(half_a.index)
+    return train, half_a, half_b
+
+
+def paraphrase_families(emb, threshold: float = 0.98, chunk: int = 2048):
+    """One family id per row: rows whose normalized embeddings have cosine >= threshold are
+    connected (data audit, Appendix A). Returns (family ids, top-1 neighbour similarity, top-1 neighbour row)."""
+    import numpy as np
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
 
+    n = len(emb)
     rows, cols = [], []
-    for start in range(0, len(emb), chunk):
-        r, c = np.nonzero(emb[start:start + chunk] @ emb.T >= threshold)
-        keep = r + start < c
-        rows.append(r[keep] + start)
+    top1, nn1 = np.empty(n, dtype=np.float32), np.empty(n, dtype=np.int64)
+    for s in range(0, n, chunk):
+        S = emb[s:s + chunk] @ emb.T
+        S[np.arange(len(S)), np.arange(s, s + len(S))] = -1.0  # ignore self
+        nn1[s:s + len(S)] = S.argmax(axis=1)
+        top1[s:s + len(S)] = S[np.arange(len(S)), nn1[s:s + len(S)]]
+        r, c = np.nonzero(S >= threshold)
+        keep = r + s < c
+        rows.append(r[keep] + s)
         cols.append(c[keep])
-    r, c = (np.concatenate(rows), np.concatenate(cols)) if rows else (np.array([], int), np.array([], int))
-    graph = coo_matrix((np.ones(len(r)), (r, c)), shape=(len(emb), len(emb)))
-    return connected_components(graph, directed=False)[1]
+    r, c = np.concatenate(rows), np.concatenate(cols)
+    graph = coo_matrix((np.ones(len(r)), (r, c)), shape=(n, n))
+    return connected_components(graph, directed=False)[1], top1, nn1
 
 
-def family_calib_split(kb: pd.DataFrame, emb: np.ndarray, threshold: float = 0.98
-                       ) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    """kb rows -> positions of train (~90%) / half_a (~5%) / half_b (~5%), drawn by WHOLE paraphrase
-    families (seed 42), so no calibration ticket has a reworded copy in train (audit items 3 + 4).
-    Returns (positions per part, family id per kb row)."""
+def family_calib_split(kb: pd.DataFrame, family) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Like calib_split (~90/5/5 of tickets: the 10%/50% cuts are of families, seed 42), but whole families stay on one side, so
+    calibration, ensemble weights and the critical threshold are tuned on tickets that have no
+    reworded copy in train (data audit #3; also fixes #4, because neighbour votes search train only)."""
     from sklearn.model_selection import GroupShuffleSplit
 
-    if len(kb) != len(emb):
-        raise ValueError("kb rows and embeddings are not aligned")
-    fam = paraphrase_families(emb, threshold)
-    tr, cal = next(GroupShuffleSplit(n_splits=1, test_size=0.10, random_state=SEED).split(emb, groups=fam))
-    a, b = next(GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=SEED).split(cal, groups=fam[cal]))
-    pos = {"train": np.sort(tr), "half_a": np.sort(cal[a]), "half_b": np.sort(cal[b])}
-    for x, y in (("train", "half_a"), ("train", "half_b"), ("half_a", "half_b")):
-        if set(fam[pos[x]]) & set(fam[pos[y]]):
-            raise AssertionError(f"family shared between {x} and {y}")
-    return pos, fam
+    kb = kb.reset_index(drop=True)
+    tr, cal = next(GroupShuffleSplit(n_splits=1, test_size=0.10, random_state=SEED).split(kb, groups=family))
+    a, b = next(GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=SEED).split(cal, groups=family[cal]))
+    train, half_a, half_b = kb.iloc[tr], kb.iloc[cal[a]], kb.iloc[cal[b]]
+    for x, y in ((train, half_a), (train, half_b), (half_a, half_b)):
+        shared = set(family[x.index]) & set(family[y.index])
+        if shared:
+            raise AssertionError(f"{len(shared)} paraphrase families span two calibration parts")
+    return train, half_a, half_b
 
 
 def build_parts(csv_path: str | Path | None = None, sample: int | None = None) -> dict[str, pd.DataFrame]:
-    """Team split via split.load_split -> {"kb", "test"}. The calibration halves are cut later, by
-    paraphrase family, once kb embeddings exist (scripts/train_triage.py). In sample mode kb is
-    subsampled so train ends up ~N tickets, test proportionally (seed 42)."""
+    """Team split via split.load_split, then triage calibration slices; in sample mode,
+    subsample every part proportionally (seed 42)."""
     kb, test = load_split(str(ensure_csv(csv_path)))
     sanity_check(kb, test)
-    parts = {"kb": kb, "test": test}
+    train, half_a, half_b = calib_split(kb)
+    parts = {"train": train, "half_a": half_a, "half_b": half_b, "test": test}
     if sample:
-        frac = min(1.0, sample / (0.9 * len(kb)))
-        parts = {k: v.sample(frac=frac, random_state=SEED).sort_index() for k, v in parts.items()}
+        frac = min(1.0, sample / len(train))
+        parts = {k: v.sample(frac=frac, random_state=SEED) for k, v in parts.items()}
     assert_disjoint({k: v["ticket_id"] for k, v in parts.items()})
     if "answer" in parts["test"].columns:
         raise AssertionError("LEAKAGE: holdout answers left split.py")
@@ -164,10 +197,10 @@ def assert_no_test_ids(ids, test_ids) -> None:
 
 
 def write_parts(parts: dict[str, pd.DataFrame], out_dir: Path) -> None:
-    """kb.parquet (training + knowledge base) and the holdout split into inputs / labels."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    kb = parts["kb"]
-    kb[[c for c in TRAIN_COLS if c in kb.columns]].to_parquet(out_dir / "kb.parquet", index=False)
+    for name in TRAIN_PARTS:
+        cols = [c for c in TRAIN_COLS if c in parts[name].columns]
+        parts[name][cols].to_parquet(out_dir / f"{name}.parquet", index=False)
     test = parts["test"]
     test[TEST_INPUT_COLS].to_parquet(out_dir / "test_inputs.parquet", index=False)
     test[TEST_LABEL_COLS].to_parquet(out_dir / "test_labels.parquet", index=False)
@@ -175,16 +208,8 @@ def write_parts(parts: dict[str, pd.DataFrame], out_dir: Path) -> None:
     log.info("wrote splits to %s: %s", out_dir, {k: len(v) for k, v in parts.items()})
 
 
-def write_calib_parts(kb: pd.DataFrame, pos: dict[str, np.ndarray], fam: np.ndarray, out_dir: Path) -> None:
-    """Record the family-based train / half_a / half_b actually used for training (for eval + audit)."""
-    cols = [c for c in TRAIN_COLS if c in kb.columns]
-    for name, p in pos.items():
-        kb.iloc[p][cols].to_parquet(out_dir / f"{name}.parquet", index=False)
-    pd.DataFrame({"ticket_id": kb["ticket_id"].values, "family": fam}).to_parquet(out_dir / "families.parquet", index=False)
-
-
 def read_part(splits_dir: Path, name: str) -> pd.DataFrame:
-    """Read kb/train/half_a/half_b/test_inputs. test_labels is only read by eval, via read_test_labels."""
+    """Read train/half_a/half_b/test_inputs. test_labels is only read by eval, via read_test_labels."""
     if name == "test_labels":
         raise PermissionError("Use read_test_labels() in scripts/eval_triage.py, after predictions are saved")
     return pd.read_parquet(splits_dir / f"{name}.parquet")

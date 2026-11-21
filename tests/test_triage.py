@@ -70,17 +70,7 @@ def csv_path(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def parts(csv_path):
-    """Team split (kb / test), then the family-based train / half_a / half_b, as train_triage.py does."""
-    from sentineldesk.triage.data import family_calib_split
-
-    base = build_parts(csv_path)
-    kb = base["kb"].reset_index(drop=True)
-    emb = FakeEmbedder()
-    E = emb.encode(build_texts(kb["subject"], kb["body"]))
-    pos, fam = family_calib_split(kb, E, 0.98)
-    out = {k: kb.iloc[v].reset_index(drop=True) for k, v in pos.items()}
-    out.update(kb=kb, test=base["test"], _embs={k: E[v] for k, v in pos.items()}, _fam=fam, _pos=pos)
-    return out
+    return build_parts(csv_path)
 
 
 @pytest.fixture(scope="module")
@@ -89,10 +79,11 @@ def trained(tmp_path_factory, parts):
     cfg = load_config()
     cfg["model_tfidf"]["use_char"] = False
     emb = FakeEmbedder()
+    embs = {k: emb.encode(build_texts(parts[k]["subject"], parts[k]["body"])) for k in ("train", "half_a", "half_b")}
     meta = {"embedding_model": "fake", "prefix": "", "dim": 128}
-    train_all(cfg, {k: parts[k] for k in ("train", "half_a", "half_b")}, parts["_embs"], root / "triage", meta,
+    train_all(cfg, {k: parts[k] for k in embs}, embs, root / "triage", meta,
               test_ids=parts["test"]["ticket_id"].tolist())
-    write_parts({"kb": parts["kb"], "test": parts["test"]}, root / "splits")
+    write_parts(parts, root / "splits")
     return root, emb
 
 
@@ -116,6 +107,29 @@ def test_build_text_raises_on_empty():
         build_text("", "  ")
 
 
+def test_build_text_turns_br_and_escaped_newlines_into_newlines():
+    assert build_text("Hi<br>there", "line1<BR/>line2<br />end") == "Hi\nthere\nline1\nline2\nend"
+    assert build_text(None, "Team,\\n\\nich melde") == "\nTeam,\n\nich melde"  # literal backslash-n
+
+
+def test_family_calib_split_keeps_families_together():
+    """Reworded copies (cosine >= 0.98) must never straddle train / half A / half B (data audit #3)."""
+    from sentineldesk.triage.data import family_calib_split, paraphrase_families
+
+    rng = np.random.default_rng(0)
+    base = rng.normal(size=(300, 16))
+    copies = base[:100] + rng.normal(scale=0.01, size=(100, 16))  # 100 near-copies of the first 100
+    E = np.vstack([base, copies]).astype(np.float32)
+    E /= np.linalg.norm(E, axis=1, keepdims=True)
+    family, top1, nn1 = paraphrase_families(E, 0.98)
+    assert len(set(family)) == 300 and (nn1[300:] == np.arange(100)).all()
+    kb = pd.DataFrame({"ticket_id": [f"T{i}" for i in range(len(E))]})
+    train, a, b = family_calib_split(kb, family)
+    assert len(train) + len(a) + len(b) == len(E) and len(a) > 0 and len(b) > 0
+    fam = {name: set(family[df.index]) for name, df in (("train", train), ("a", a), ("b", b))}
+    assert not (fam["train"] & fam["a"]) and not (fam["train"] & fam["b"]) and not (fam["a"] & fam["b"])
+
+
 def test_build_text_matches_team_split_text(csv_path):
     """The shared index is built from split.py's `text`; triage must embed the identical string."""
     from split import load_split
@@ -131,14 +145,21 @@ def test_searchable_flag():
     assert not is_searchable("Thanks, we fixed it.")                       # under 40 chars
     assert not is_searchable("<name> <acc_num> <tel_num> <email> <name> <name>")  # placeholders only
     assert is_searchable("Dear <name>, please restart the VPN client and clear the cache, then retry.")
+    # data audit #7: broken / echo-only rows (needs subject + body)
+    ans = "Dear <name>, please restart the VPN client and clear the cache, then retry."
+    body = "Our VPN client keeps disconnecting every few minutes since this morning's update."
+    assert is_searchable(ans, "VPN drops", body)
+    assert not is_searchable(ans, "", "VPN broken")                                     # under 6 words
+    assert not is_searchable(ans, "Hi", "Hallo [Name], wir danken Ihnen für Ihr Interesse an unserem Produkt.")
+    assert not is_searchable(ans, "VPN", "Please restart the VPN client and clear the cache, then retry dear.")  # echo
 
 
 # ---------- split / leakage ---------------------------------------------------------------------
 def test_split_reproducible_disjoint_and_complete(parts, csv_path):
     again = build_parts(csv_path)
-    for k in ("kb", "test"):
+    for k in parts:
         assert parts[k]["ticket_id"].tolist() == again[k]["ticket_id"].tolist()
-    all_ids = [i for k in ("train", "half_a", "half_b", "test") for i in parts[k]["ticket_id"]]
+    all_ids = [i for p in parts.values() for i in p["ticket_id"]]
     assert len(all_ids) == len(set(all_ids)) == 900
     assert "answer" not in parts["test"].columns
 
@@ -148,26 +169,8 @@ def test_parts_follow_team_split(parts, csv_path):
 
     kb, test = load_split(str(csv_path))
     assert parts["test"]["ticket_id"].tolist() == test["ticket_id"].tolist()
-    assert parts["kb"]["ticket_id"].tolist() == kb["ticket_id"].tolist()
     triage_kb = set().union(*(parts[k]["ticket_id"] for k in ("train", "half_a", "half_b")))
     assert triage_kb == set(kb["ticket_id"])
-
-
-def test_family_split_keeps_reworded_copies_together():
-    """Audit items 3 + 4: no paraphrase family may span train and the calibration halves."""
-    from sentineldesk.triage.data import family_calib_split, paraphrase_families
-
-    rng = np.random.default_rng(0)
-    base = rng.normal(size=(150, 16))
-    E = np.repeat(base, 4, axis=0) + rng.normal(scale=1e-3, size=(600, 16))  # 150 families x 4 copies
-    E = (E / np.linalg.norm(E, axis=1, keepdims=True)).astype(np.float32)
-    fam = paraphrase_families(E, 0.98)
-    assert len(set(fam)) == 150
-    pos, fam2 = family_calib_split(pd.DataFrame({"ticket_id": range(600)}), E, 0.98)
-    assert sorted(np.concatenate(list(pos.values()))) == list(range(600))
-    for a, b in (("train", "half_a"), ("train", "half_b"), ("half_a", "half_b")):
-        assert not set(fam2[pos[a]]) & set(fam2[pos[b]])
-    assert len(pos["half_a"]) > 0 and len(pos["half_b"]) > 0
 
 
 def test_assert_disjoint_catches_leak():
@@ -223,13 +226,6 @@ def test_keyword_matching():
     assert kw.matches("kein Zugriffsrecht")[0] == []
     assert kw.matches("Große STÖRUNG im Netz")[0] == ["störung"]
     assert kw.matches("I can’t access email")[0] == ["can't access"]
-
-
-def test_feature_cleaning_literal_newlines_and_br():
-    from sentineldesk.triage.text import clean_for_features
-
-    assert clean_for_features("Hi\\nserver<br>down<BR/>now") == "Hi\nserver\ndown\nnow"
-    assert KeywordMatcher(["down"]).matches("server\\ndown")[0] == ["down"]   # literal \n no longer glues words
 
 
 def test_keyword_yaml_loads():

@@ -51,20 +51,6 @@ def predict_holdout(triage: Triage, test: pd.DataFrame, chunk: int = 512) -> tup
     return pred, {"critical_threshold": thr}
 
 
-def copy_flags(root, triage: Triage, test: pd.DataFrame, threshold: float) -> np.ndarray | None:
-    """True where a holdout ticket has a reworded copy in kb (nearest-kb cosine >= threshold).
-    Text-only (embeddings of the holdout inputs), so no holdout label or answer is read."""
-    edir = root / "embeddings" / model_slug(triage.meta["embedding_model"])
-    need = [edir / f for f in ("kb.npy", "test_inputs.npy", "test_inputs_ids.json")]
-    if not all(f.exists() for f in need):
-        return None
-    if json.loads((edir / "test_inputs_ids.json").read_text()) != test["ticket_id"].tolist():
-        return None
-    kb, te = np.load(edir / "kb.npy"), np.load(edir / "test_inputs.npy")
-    best = np.concatenate([(te[s:s + 1024] @ kb.T).max(1) for s in range(0, len(te), 1024)])
-    return best >= threshold
-
-
 def latency(triage: Triage, test: pd.DataFrame, n: int = 200) -> dict:
     rows = test.head(n)
     triage.predict(rows.iloc[0]["subject"], rows.iloc[0]["body"])  # warm-up
@@ -206,20 +192,6 @@ def main() -> None:
 
     crit_true = ((gold["type"] == "Incident") & (gold["priority"] == "high")).to_numpy()
 
-    # All / known (reworded copy in kb) / novel holdout tickets (docs/DATA_PREPROCESSING.md item 2)
-    known = copy_flags(root, triage, test, cfg["calibration"].get("family_threshold", 0.98))
-    if known is not None:
-        metrics["slices"] = {}
-        for name, m in (("all", np.ones(len(pred), bool)), ("known_copy_in_kb", known), ("novel", ~known)):
-            if not m.any():
-                continue
-            sl = {"n": int(m.sum())}
-            for t in TASKS:
-                sl[f"macro_f1_{t}"] = round(f1_score(gold[t][m], pred[f"pred_{best}_{t}"][m], average="macro"), 4)
-            ct, fires = crit_true[m], pred["critical_fires"].to_numpy()[m]
-            sl["critical_recall"] = round(float((fires & ct).sum() / max(ct.sum(), 1)), 4)
-            metrics["slices"][name] = sl
-
     def pr(flag):
         tp = int((flag & crit_true).sum())
         return {"recall": tp / max(int(crit_true.sum()), 1), "precision": tp / max(int(flag.sum()), 1),
@@ -233,13 +205,34 @@ def main() -> None:
         "labels_or_detector": pr(labels_only | pred["critical_fires"].to_numpy()),
         **info,
     }
+    # Data audit #2: ~half the holdout are reworded copies of KB tickets, which flatters the score.
+    # Report "novel" tickets (nearest KB ticket below the family threshold) next to the official number.
+    # Uses text embeddings only (allowed); labels were already unlocked above.
+    edir = root / "embeddings" / model_slug(triage.meta["embedding_model"])
+    kb_ids = sum((json.loads((edir / f"{p}_ids.json").read_text()) for p in ("train", "half_a", "half_b")), [])
+    assert_no_test_ids(kb_ids, test["ticket_id"])
+    KB = np.concatenate([np.load(edir / f"{p}.npy") for p in ("train", "half_a", "half_b")])
+    test_order = json.loads((edir / "test_inputs_ids.json").read_text())
+    if test_order != pred["ticket_id"].tolist():
+        raise ValueError("test_inputs embeddings are not in prediction order; re-run scripts/embed.py")
+    T = np.load(edir / "test_inputs.npy")
+    near = np.concatenate([(T[s:s + 1024] @ KB.T).max(axis=1) for s in range(0, len(T), 1024)])
+    novel = near < cfg["calibration"].get("family_threshold", 0.98)
+    metrics["novel_slice"] = {
+        "n": int(novel.sum()), "share": round(float(novel.mean()), 4),
+        "macro_f1": {t: round(f1_score(gold[t][novel], pred[f"pred_{best}_{t}"][novel], average="macro"), 4)
+                     for t in TASKS},
+        "high_priority_incident_recall": {
+            "labels_or_detector": round(float(((labels_only | pred["critical_fires"].to_numpy()) & crit_true & novel).sum()
+                                              / max(int((crit_true & novel).sum()), 1)), 4),
+            "positives": int((crit_true & novel).sum())},
+    }
     plot_pr(crit_true.astype(int), pred["critical_score"].to_numpy(), info["critical_threshold"],
             out / "plots" / "critical_pr_curve.png")
     if not args.no_latency:
         metrics["latency_single_ticket"] = latency(triage, test)
     (out / "triage_metrics.json").write_text(json.dumps(metrics, indent=2))
-    print(json.dumps({k: metrics[k] for k in ("mode", "macro_f1", "high_priority_incident", "calibration_holdout")
-                      + (("slices",) if "slices" in metrics else ())
+    print(json.dumps({k: metrics[k] for k in ("mode", "macro_f1", "high_priority_incident", "novel_slice", "calibration_holdout")
                       + (("latency_single_ticket",) if "latency_single_ticket" in metrics else ())}, indent=2))
     print(f"wrote {out / 'triage_metrics.json'} and plots in {out / 'plots'}")
 

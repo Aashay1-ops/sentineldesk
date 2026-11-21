@@ -10,7 +10,6 @@ from sklearn.pipeline import FeatureUnion
 
 from sentineldesk.triage import TASKS
 from sentineldesk.triage.labels import align_proba
-from sentineldesk.triage.text import clean_for_features
 
 
 def make_vectorizer(use_char: bool = True) -> FeatureUnion:
@@ -30,7 +29,7 @@ class TfidfLR:
         self.clfs: dict[str, LogisticRegression] = {}
 
     def fit(self, texts: list[str], df: pd.DataFrame) -> "TfidfLR":
-        X = self.vec.fit_transform([clean_for_features(t) for t in texts])
+        X = self.vec.fit_transform(texts)
         for t in TASKS:
             lr = LogisticRegression(C=self.C, class_weight="balanced", solver=self.solver,
                                     max_iter=self.max_iter, tol=self.tol, random_state=42)
@@ -40,7 +39,7 @@ class TfidfLR:
         return self
 
     def transform(self, texts: list[str]):
-        return self.vec.transform([clean_for_features(t) for t in texts])
+        return self.vec.transform(texts)
 
     def predict_proba(self, X, labels: dict[str, list[str]]) -> dict[str, np.ndarray]:
         return {t: align_proba(c, c.predict_proba(X), labels[t]) for t, c in self.clfs.items()}

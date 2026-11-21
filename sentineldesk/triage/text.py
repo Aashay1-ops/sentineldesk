@@ -11,13 +11,14 @@ import math
 import re
 import unicodedata
 
-_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_BR = re.compile(r"(?i)<br\s*/?>")
 
 
 def _clean(x) -> str:
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return ""
-    return str(x)
+    # same fix, same order as split.py (literal backslash-n, then <br>), so live text == training text
+    return _BR.sub("\n", str(x).replace("\\n", "\n"))
 
 
 def normalize(text: str) -> str:
@@ -30,12 +31,6 @@ def build_text(subject, body) -> str:
     if not (s.strip() or b.strip()):
         raise ValueError("Ticket has no subject and no body")
     return s + "\n" + b
-
-
-def clean_for_features(text: str) -> str:
-    """Literal "\\n" escapes and <br> tags -> real line breaks (docs/DATA_PREPROCESSING.md, item 6).
-    Used for TF-IDF and keyword matching only; the embedding text stays identical to split.py's `text`."""
-    return _BR.sub("\n", text.replace("\\n", "\n"))
 
 
 def build_texts(subjects, bodies) -> list[str]:
