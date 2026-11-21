@@ -26,7 +26,7 @@ from ui.examples import BURST_TICKETS
 from ui.probes import IN_DOMAIN, OUT_OF_DOMAIN
 
 QUEUE_FLOOR = 0.30   # chosen floor; the report shows the accuracy split around it
-SIGMA = 0.87         # README value for e5-base
+from retrieve import SIGMA  # noqa: E402  the team's "no precedent" threshold (0.86)
 
 
 def main() -> None:

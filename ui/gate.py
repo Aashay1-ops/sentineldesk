@@ -58,7 +58,7 @@ class GateConfig:
     critical_threshold: float = 0.44     # triage: catches >= 90% of high-priority Incidents on half B
     min_type_confidence: float = 0.50    # triage's suggested threshold (half B)
     min_queue_confidence: float = 0.30   # scripts/build_ui_report.py (half B)
-    min_similarity: float = 0.87         # sigma, README "No precedent threshold" for e5-base
+    min_similarity: float = 0.86         # sigma = retrieve.SIGMA (README "Retrieval results")
     top_k: int = 5
 
 
@@ -84,7 +84,8 @@ def evaluate_gate(tri: dict, precedents: list[dict], sensitive_hits: dict[str, l
         d.add(Reason("LOW_CONFIDENCE", Status.REVIEW,
                      "Low triage confidence on " + ", ".join(f"{k} ({v:.0%})" for k, v in low.items()), low))
 
-    best = precedents[0]["similarity"] if precedents else 0.0
+    # = retrieve.top_similarity(): the best cosine among the results, not rank 1's (boosts reorder results)
+    best = max((p["similarity"] for p in precedents), default=0.0)
     if best < cfg.min_similarity:
         d.has_precedent = False
         d.add(Reason("NO_PRECEDENT", Status.REVIEW,

@@ -8,13 +8,17 @@ embedded from the same string or they silently stop matching the index. Unicode 
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
+
+_BR = re.compile(r"(?i)<br\s*/?>")
 
 
 def _clean(x) -> str:
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return ""
-    return str(x)
+    # same fix, same order as split.py (literal backslash-n, then <br>), so live text == training text
+    return _BR.sub("\n", str(x).replace("\\n", "\n"))
 
 
 def normalize(text: str) -> str:

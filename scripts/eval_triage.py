@@ -11,7 +11,7 @@ from _common import parser, setup_logging
 
 from sentineldesk.triage import TASKS
 from sentineldesk.triage.calibration import ece, reliability
-from sentineldesk.triage.config import artifacts_dir, load_config, results_dir
+from sentineldesk.triage.config import artifacts_dir, load_config, model_slug, results_dir
 from sentineldesk.triage.data import assert_no_test_ids, read_part, read_test_labels
 from sentineldesk.triage.labels import encode
 from sentineldesk.triage.predict import Triage
@@ -205,12 +205,34 @@ def main() -> None:
         "labels_or_detector": pr(labels_only | pred["critical_fires"].to_numpy()),
         **info,
     }
+    # Data audit #2: ~half the holdout are reworded copies of KB tickets, which flatters the score.
+    # Report "novel" tickets (nearest KB ticket below the family threshold) next to the official number.
+    # Uses text embeddings only (allowed); labels were already unlocked above.
+    edir = root / "embeddings" / model_slug(triage.meta["embedding_model"])
+    kb_ids = sum((json.loads((edir / f"{p}_ids.json").read_text()) for p in ("train", "half_a", "half_b")), [])
+    assert_no_test_ids(kb_ids, test["ticket_id"])
+    KB = np.concatenate([np.load(edir / f"{p}.npy") for p in ("train", "half_a", "half_b")])
+    test_order = json.loads((edir / "test_inputs_ids.json").read_text())
+    if test_order != pred["ticket_id"].tolist():
+        raise ValueError("test_inputs embeddings are not in prediction order; re-run scripts/embed.py")
+    T = np.load(edir / "test_inputs.npy")
+    near = np.concatenate([(T[s:s + 1024] @ KB.T).max(axis=1) for s in range(0, len(T), 1024)])
+    novel = near < cfg["calibration"].get("family_threshold", 0.98)
+    metrics["novel_slice"] = {
+        "n": int(novel.sum()), "share": round(float(novel.mean()), 4),
+        "macro_f1": {t: round(f1_score(gold[t][novel], pred[f"pred_{best}_{t}"][novel], average="macro"), 4)
+                     for t in TASKS},
+        "high_priority_incident_recall": {
+            "labels_or_detector": round(float(((labels_only | pred["critical_fires"].to_numpy()) & crit_true & novel).sum()
+                                              / max(int((crit_true & novel).sum()), 1)), 4),
+            "positives": int((crit_true & novel).sum())},
+    }
     plot_pr(crit_true.astype(int), pred["critical_score"].to_numpy(), info["critical_threshold"],
             out / "plots" / "critical_pr_curve.png")
     if not args.no_latency:
         metrics["latency_single_ticket"] = latency(triage, test)
     (out / "triage_metrics.json").write_text(json.dumps(metrics, indent=2))
-    print(json.dumps({k: metrics[k] for k in ("mode", "macro_f1", "high_priority_incident", "calibration_holdout")
+    print(json.dumps({k: metrics[k] for k in ("mode", "macro_f1", "high_priority_incident", "novel_slice", "calibration_holdout")
                       + (("latency_single_ticket",) if "latency_single_ticket" in metrics else ())}, indent=2))
     print(f"wrote {out / 'triage_metrics.json'} and plots in {out / 'plots'}")
 

@@ -107,6 +107,29 @@ def test_build_text_raises_on_empty():
         build_text("", "  ")
 
 
+def test_build_text_turns_br_and_escaped_newlines_into_newlines():
+    assert build_text("Hi<br>there", "line1<BR/>line2<br />end") == "Hi\nthere\nline1\nline2\nend"
+    assert build_text(None, "Team,\\n\\nich melde") == "\nTeam,\n\nich melde"  # literal backslash-n
+
+
+def test_family_calib_split_keeps_families_together():
+    """Reworded copies (cosine >= 0.98) must never straddle train / half A / half B (data audit #3)."""
+    from sentineldesk.triage.data import family_calib_split, paraphrase_families
+
+    rng = np.random.default_rng(0)
+    base = rng.normal(size=(300, 16))
+    copies = base[:100] + rng.normal(scale=0.01, size=(100, 16))  # 100 near-copies of the first 100
+    E = np.vstack([base, copies]).astype(np.float32)
+    E /= np.linalg.norm(E, axis=1, keepdims=True)
+    family, top1, nn1 = paraphrase_families(E, 0.98)
+    assert len(set(family)) == 300 and (nn1[300:] == np.arange(100)).all()
+    kb = pd.DataFrame({"ticket_id": [f"T{i}" for i in range(len(E))]})
+    train, a, b = family_calib_split(kb, family)
+    assert len(train) + len(a) + len(b) == len(E) and len(a) > 0 and len(b) > 0
+    fam = {name: set(family[df.index]) for name, df in (("train", train), ("a", a), ("b", b))}
+    assert not (fam["train"] & fam["a"]) and not (fam["train"] & fam["b"]) and not (fam["a"] & fam["b"])
+
+
 def test_build_text_matches_team_split_text(csv_path):
     """The shared index is built from split.py's `text`; triage must embed the identical string."""
     from split import load_split
@@ -122,6 +145,13 @@ def test_searchable_flag():
     assert not is_searchable("Thanks, we fixed it.")                       # under 40 chars
     assert not is_searchable("<name> <acc_num> <tel_num> <email> <name> <name>")  # placeholders only
     assert is_searchable("Dear <name>, please restart the VPN client and clear the cache, then retry.")
+    # data audit #7: broken / echo-only rows (needs subject + body)
+    ans = "Dear <name>, please restart the VPN client and clear the cache, then retry."
+    body = "Our VPN client keeps disconnecting every few minutes since this morning's update."
+    assert is_searchable(ans, "VPN drops", body)
+    assert not is_searchable(ans, "", "VPN broken")                                     # under 6 words
+    assert not is_searchable(ans, "Hi", "Hallo [Name], wir danken Ihnen für Ihr Interesse an unserem Produkt.")
+    assert not is_searchable(ans, "VPN", "Please restart the VPN client and clear the cache, then retry dear.")  # echo
 
 
 # ---------- split / leakage ---------------------------------------------------------------------

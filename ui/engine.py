@@ -83,8 +83,13 @@ class Desk:
 
         if not force_mock:
             try:
-                from retrieve import search  # locked interface (Chirag)
-                src["Search"] = "real (hybrid)"
+                import retrieve  # locked interface (Chirag)
+
+                retriever = retrieve.Retriever(embedder=triage.embedder if triage else None)  # share one e5 model
+                search = _with_ticket_details(retriever)
+                encode = encode or retriever.embedder.encode
+                cfg.min_similarity = float(retrieve.SIGMA)
+                src["Search"] = "real (hybrid, retrieve.py)"
             except ImportError:
                 idx = REPO / index_dir
                 if (idx / "emb.npy").exists():
@@ -190,3 +195,21 @@ class Desk:
 
 def _ms(t0: float) -> float:
     return round((time.perf_counter() - t0) * 1000, 1)
+
+
+def _with_ticket_details(retriever):
+    """retrieve.search() returns the locked fields; the console's "Full ticket" view also shows the customer's
+    message and tags, looked up in the same index rows."""
+    kb, row = retriever.kb, retriever.row
+    tags = [f"tag_{i}" for i in range(1, 9)]
+
+    def search(text, k=5, preds=None, lang=None, exclude_ids=None, pool_ids=None):
+        hits = retriever.search(text, k, preds, lang, exclude_ids, pool_ids)
+        for h in hits:
+            r = kb.iloc[row[h["ticket_id"]]]
+            full, subj = r["text"], h.get("subject") or ""
+            h["body"] = full[len(subj) + 1:] if full.startswith(subj + "\n") else full
+            h["tags"] = [t for t in (r[c] for c in tags) if isinstance(t, str) and t]
+        return hits
+
+    return search

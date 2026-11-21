@@ -76,20 +76,41 @@ KB_INDEX_COLS = ["ticket_id", "text", "subject", "answer", "language", "type", "
     f"tag_{i}" for i in range(1, 9)
 ]
 _PLACEHOLDER = re.compile(r"<[^<>\s]{1,40}>")
+_WORD = re.compile(r"(?u)\b[^\W\d_]{2,}\b")
+# Data audit #7 (docs/DATA_PREPROCESSING.md section 5): a customer body written in the agent's voice.
+_AGENT_OPENER = re.compile(
+    r"(?i)^\s*(?:thank you|thanks for|we appreciate|we apologi[sz]e|we are sorry|we're sorry|"
+    r"vielen dank|danke für|wir entschuldigen|es tut uns leid|wir freuen uns|wir schätzen|wir danken|"
+    r"(?:dear|hello|hi|hallo|sehr geehrte\w*)\s+(?:\[|<|\{)?\s*(?:name|ihr name)\b)")
 
 
-def is_searchable(answer) -> bool:
-    """README rule: False for empty, placeholder-only or under-40-character answers."""
-    if answer is None or (isinstance(answer, float) and math.isnan(answer)):
+def _text(x) -> str:
+    return "" if x is None or (isinstance(x, float) and math.isnan(x)) else str(x)
+
+
+def is_searchable(answer, subject=None, body=None) -> bool:
+    """False for empty, placeholder-only or under-40-character answers (README), and, when subject/body
+    are given, for the audit's broken rows: agent-voice opener, body/answer word Jaccard >= 0.60
+    (copied or echo-only answer), or under 6 words of subject + body.
+    ponytail: the audit's agent-voice classifier is not used (needs a trained model); ~2.5% of
+    broken rows remain per the audit's sample."""
+    a = _text(answer).strip()
+    if len(a) < 40 or not re.search(r"[^\W\d_]", _PLACEHOLDER.sub("", a)):
         return False
-    a = str(answer).strip()
-    return len(a) >= 40 and bool(re.search(r"[^\W\d_]", _PLACEHOLDER.sub("", a)))
+    if body is None:
+        return True
+    s, b = _text(subject), _text(body)
+    if len((s + " " + b).split()) < 6 or _AGENT_OPENER.match(b):
+        return False
+    wa, wb = {w.lower() for w in _WORD.findall(a)}, {w.lower() for w in _WORD.findall(b)}
+    return not (wa and wb and len(wa & wb) / len(wa | wb) >= 0.60)
 
 
 def kb_index_frame(kb: pd.DataFrame) -> pd.DataFrame:
     """Rows for data/index/kb.pkl, in load_split() order, plus the `searchable` flag."""
     out = kb[[c for c in KB_INDEX_COLS if c in kb.columns]].reset_index(drop=True).copy()
-    out["searchable"] = out["answer"].map(is_searchable)
+    body = kb["body"].reset_index(drop=True) if "body" in kb.columns else [None] * len(out)
+    out["searchable"] = [is_searchable(a, s, b) for a, s, b in zip(out["answer"], out["subject"], body)]
     return out
 
 
@@ -99,6 +120,47 @@ def calib_split(kb: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
     train = kb.drop(calib.index)
     half_a = calib.sample(frac=0.5, random_state=SEED)
     half_b = calib.drop(half_a.index)
+    return train, half_a, half_b
+
+
+def paraphrase_families(emb, threshold: float = 0.98, chunk: int = 2048):
+    """One family id per row: rows whose normalized embeddings have cosine >= threshold are
+    connected (data audit, Appendix A). Returns (family ids, top-1 neighbour similarity, top-1 neighbour row)."""
+    import numpy as np
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    n = len(emb)
+    rows, cols = [], []
+    top1, nn1 = np.empty(n, dtype=np.float32), np.empty(n, dtype=np.int64)
+    for s in range(0, n, chunk):
+        S = emb[s:s + chunk] @ emb.T
+        S[np.arange(len(S)), np.arange(s, s + len(S))] = -1.0  # ignore self
+        nn1[s:s + len(S)] = S.argmax(axis=1)
+        top1[s:s + len(S)] = S[np.arange(len(S)), nn1[s:s + len(S)]]
+        r, c = np.nonzero(S >= threshold)
+        keep = r + s < c
+        rows.append(r[keep] + s)
+        cols.append(c[keep])
+    r, c = np.concatenate(rows), np.concatenate(cols)
+    graph = coo_matrix((np.ones(len(r)), (r, c)), shape=(n, n))
+    return connected_components(graph, directed=False)[1], top1, nn1
+
+
+def family_calib_split(kb: pd.DataFrame, family) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Like calib_split (~90/5/5 of tickets: the 10%/50% cuts are of families, seed 42), but whole families stay on one side, so
+    calibration, ensemble weights and the critical threshold are tuned on tickets that have no
+    reworded copy in train (data audit #3; also fixes #4, because neighbour votes search train only)."""
+    from sklearn.model_selection import GroupShuffleSplit
+
+    kb = kb.reset_index(drop=True)
+    tr, cal = next(GroupShuffleSplit(n_splits=1, test_size=0.10, random_state=SEED).split(kb, groups=family))
+    a, b = next(GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=SEED).split(cal, groups=family[cal]))
+    train, half_a, half_b = kb.iloc[tr], kb.iloc[cal[a]], kb.iloc[cal[b]]
+    for x, y in ((train, half_a), (train, half_b), (half_a, half_b)):
+        shared = set(family[x.index]) & set(family[y.index])
+        if shared:
+            raise AssertionError(f"{len(shared)} paraphrase families span two calibration parts")
     return train, half_a, half_b
 
 

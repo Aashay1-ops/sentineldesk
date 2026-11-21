@@ -42,6 +42,8 @@ ensemble:                  # model 6
 calibration:
   ece_bins: 15
   conf_threshold_min_bin: 10   # bins with fewer tickets are ignored for suggested thresholds
+  family_threshold: 0.98       # data audit #3: cosine >= this = reworded copy; halves A/B are drawn by whole family
+                               # and eval reports "novel" holdout tickets (no KB copy) separately
 
 critical:                  # model 5
   target_recall: 0.90
