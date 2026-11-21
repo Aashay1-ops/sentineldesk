@@ -209,9 +209,41 @@ def test_page_out_of_scope_gets_holding_reply(app):
 def test_page_stream_and_empty_ticket(app):
     app.selectbox(key="example").set_value(EXAMPLES["export_question"][0]).run()
     app.button(key="FormSubmitter:ticket-Triage ticket").click().run()
+    assert not app.exception and "sd-flow" in " ".join(m.value for m in app.markdown)  # pipeline strip shown
+    app.get("button_group")[0].set_value("👩‍💼 Review queue").run()  # switch to the HITL review queue
     next(b for b in app.button if b.label.startswith("Stream")).click().run()
     assert len(app.session_state["history"]) == 1 + len(STREAM_TICKETS)
+    queued = app.session_state["queue"]
+    assert queued and all(i["status"] != "AUTO_DRAFT_READY" for i in queued)
+    first = next(b for b in app.button if b.label.startswith("✅ Send reply"))
+    first.click().run()
+    assert sum(i["state"] == "resolved" for i in app.session_state["queue"]) == 1 and not app.exception
+    app.get("button_group")[0].set_value("🎫 Live triage").run()
     app.text_input(key="subject").set_value("")
     app.text_area(key="body").set_value("")
     app.button(key="FormSubmitter:ticket-Triage ticket").click().run()
     assert any("Enter a subject or a body" in w.value for w in app.warning)
+
+
+def test_llm_draft_shown_only_when_verify_passes():
+    from sentineldesk.verify import verify
+    from sentineldesk.draft import DraftError
+    p = [_prec()]
+    text = "printer\nMy printer stopped printing after the update. What should I do?"
+    good = lambda *a: {"reply": "Hello, please reinstall the printer driver from the support page, which fixes "
+                                "this issue in most cases [TKT-00001]. Best regards", "cited_ids": ["TKT-00001"],
+                       "unsupported_asks": [], "model": "fake", "latency_ms": 1}
+    d = draft_reply(text, "en", p, "AUTO_DRAFT_READY", True, llm=good, check=verify)
+    assert d.mode == "llm" and d.cited_ticket_ids == ["TKT-00001"] and not d.issues
+    assert "TKT-00001" in d.trace["prompt"][1] and d.trace["raw"]["reply"] and all(c["passed"] for c in d.trace["checks"])
+    bad = lambda *a: {"reply": "We will refund 500 EUR today, see TKT-99999.", "cited_ids": ["TKT-99999"],
+                      "unsupported_asks": ["refund"]}
+    d = draft_reply(text, "en", p, "AUTO_DRAFT_READY", True, llm=bad, check=verify)
+    assert d.mode == "holding" and "500" not in d.reply and d.issues and d.unsupported_requests == ["refund"]
+    def down(*a):
+        raise DraftError("HTTP 429")
+    d = draft_reply(text, "en", p, "AUTO_DRAFT_READY", True, llm=down, check=verify)
+    assert d.mode == "extractive" and "LLM unavailable" in d.internal_note
+    called = []
+    d = draft_reply(text, "en", p, "HUMAN_REVIEW", True, llm=lambda *a: called.append(1), check=verify)
+    assert not called  # reviewed / escalated tickets never spend an LLM call

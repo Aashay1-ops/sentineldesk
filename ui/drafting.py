@@ -11,6 +11,7 @@ no refund talk unless it is deferred to a person, and the reply must be in the r
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 
 from pii import mask
@@ -58,6 +59,8 @@ class DraftResult:
     grounding: str = "partial"
     internal_note: str = ""
     issues: list[str] = field(default_factory=list)
+    timings: dict = field(default_factory=dict)  # draft / verify ms and LLM model name (pipeline strip)
+    trace: dict = field(default_factory=dict)    # LLM path: prompt (system, user), raw JSON, verify checks
 
 
 # ---------------------------------------------------------------- resolution cleanup
@@ -162,7 +165,48 @@ def verify_draft(draft: DraftResult, precedents: list[dict], ticket_text: str, l
     return draft
 
 
-def draft_reply(ticket_text, language, precedents, status, has_precedent, injection=False) -> DraftResult:
+def llm_draft(ticket_text, language, precedents, status, llm, check) -> DraftResult:
+    """Team draft (sentineldesk/draft.py) + team verify (sentineldesk/verify.py). A draft that fails verify is
+    never shown (README: verify must pass, or the ticket escalates): the holding reply replaces it and the
+    failures become issues, which the gate turns into DRAFT_GUARD. LLM unavailable -> offline extractive draft."""
+    t0 = time.perf_counter()
+    trace: dict = {}
+    try:
+        from sentineldesk.draft import build_prompt  # same pure function draft() uses: the exact prompt sent
+
+        trace["prompt"] = build_prompt(ticket_text, precedents, language)
+        out = llm(ticket_text, precedents, language)
+    except Exception as e:  # DraftError (no key, quota, timeout) or anything else: never crash the console
+        d = verify_draft(extractive_draft(language, precedents, status), precedents, ticket_text, language)
+        d.internal_note = f"LLM unavailable ({type(e).__name__}: {str(e)[:160]}) - offline extractive draft instead."
+        d.timings = {"draft": (time.perf_counter() - t0) * 1000, "model": "LLM unavailable"}
+        d.trace = {**trace, "error": f"{type(e).__name__}: {e}"}
+        return d
+    t1 = time.perf_counter()
+    res = check(out, precedents, ticket_text, language)
+    trace.update(raw=out, checks=res.get("checks", []), failures=res.get("failures", []))
+    timings = {"draft": (t1 - t0) * 1000, "verify": (time.perf_counter() - t1) * 1000, "model": out.get("model")}
+    model = f"{out.get('model', 'LLM')} in {out.get('latency_ms', '?')} ms"
+    asks = [str(a) for a in out.get("unsupported_asks") or []]
+    if res["passed"]:
+        return DraftResult(reply=out["reply"], mode="llm", cited_ticket_ids=list(out["cited_ids"]), grounding="full",
+                           internal_note=f"Drafted by {model}; passed all verify checks.", timings=timings,
+                           trace=trace)
+    d = holding_reply(language, status)
+    d.trace = trace
+    d.issues = [f"{f['check']}: {f['detail']}" for f in res["failures"] if f["code"] != "UNSUPPORTED_ASK"]
+    d.unsupported_requests = asks
+    d.internal_note = f"LLM draft ({model}) failed verify, so it is hidden; holding reply shown instead."
+    d.timings = timings
+    return d
+
+
+def draft_reply(ticket_text, language, precedents, status, has_precedent, injection=False,
+                llm=None, check=None) -> DraftResult:
+    if llm and check and status == "AUTO_DRAFT_READY" and has_precedent and not injection:
+        # ponytail: the LLM only drafts tickets the gate already cleared (saves quota; reviewed/escalated
+        # tickets keep the offline draft). Upgrade path: also draft HUMAN_REVIEW tickets for the agent.
+        return llm_draft(ticket_text, language, precedents, status, llm, check)
     if injection:
         # Adversarial input: nothing is generated from this text - fixed holding reply for the human reviewer.
         d = holding_reply(language, status)
