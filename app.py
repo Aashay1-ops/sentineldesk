@@ -18,6 +18,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+from ui import flow, hitl, trace
 from ui.drafting import clean_resolution
 from ui.engine import Desk
 from ui.examples import BURST_TICKETS, EXAMPLES, STREAM_TICKETS
@@ -78,14 +79,17 @@ def get_desk() -> Desk:
 desk = get_desk()
 report = desk.report
 ss = st.session_state
-for key, val in (("history", []), ("analysis", None), ("subject", ""), ("body", "")):
+for key, val in (("history", []), ("queue", []), ("analysis", None), ("subject", ""), ("body", ""),
+                 ("_pending_run", False)):
     ss.setdefault(key, val)
+st.markdown(flow.CSS, unsafe_allow_html=True)
 
 PLACEHOLDER = "— choose an example ticket —"
 LABELS = {label: slug for slug, (label, _, _) in EXAMPLES.items()}
 
 
-def record(a: dict, gate) -> None:
+def record(a: dict, gate, draft) -> None:
+    hitl.enqueue(ss.queue, a, gate, draft)  # REVIEW / ON-CALL tickets go to the human review queue
     tri = a["triage"]
     ss.history.insert(0, {
         "ref": a["ref"], "time": datetime.now().strftime("%H:%M:%S"), "subject": a["subject"] or "(no subject)",
@@ -102,6 +106,9 @@ with st.sidebar:
     cross_lingual = st.toggle("Cross-lingual precedent search", value=True,
                               help="Let German tickets use English resolutions (and vice versa); the reply stays in the requester's language.")
     top_k = st.slider("Precedents to retrieve (k)", 3, 5, desk.cfg.top_k)
+    stage_pause = st.slider("Stage animation (s per stage)", 0.0, 1.0, 0.35, 0.05,
+                            help="Pause between pipeline stages in the live strip, so the audience can follow. "
+                                 "The work itself runs at full speed; 0 = no animation.")
 
     with st.expander("Gate thresholds (tuned on half B)"):
         curve = {round(c["threshold"], 2): c for c in report.get("critical_curve", [])}
@@ -155,8 +162,7 @@ with st.sidebar:
     b1, b2 = st.columns(2)
     if b1.button("Simulate burst", width="stretch"):
         for subj, body in BURST_TICKETS:
-            a, g, _ = desk.process(subj, body, cfg, k=top_k, cross_lingual=cross_lingual)
-            record(a, g)
+            record(*desk.process(subj, body, cfg, k=top_k, cross_lingual=cross_lingual))
         st.toast(f"Injected {len(BURST_TICKETS)} SSO-failure tickets into the live window")
     if b2.button("Reset window", width="stretch"):
         desk.burst.reset()
@@ -184,6 +190,25 @@ if alert and time.time() - alert.last_seen <= desk.burst.window:
     )
 
 
+# ----------------------------------------------------------------------------- view switch
+n_pending = len(hitl.pending(ss.queue))
+QUEUE_VIEW = "👩‍💼 Review queue"  # fixed label: a label that changes resets the widget (and the view)
+v1, v2 = st.columns([3, 2], vertical_alignment="center")
+view = v1.segmented_control("View", ["🎫 Live triage", QUEUE_VIEW], default="🎫 Live triage", key="view",
+                            label_visibility="collapsed")
+n_oncall = sum(i["status"] == hitl.ONCALL for i in hitl.pending(ss.queue))
+v2.markdown(f"**{n_pending}** waiting for review" + (f" · 🚨 **{n_oncall}** on-call" if n_oncall else ""))
+if view == QUEUE_VIEW:
+    if st.button(f"Stream {len(STREAM_TICKETS)} demo tickets into the queue"):
+        with st.spinner("Processing ..."):
+            for s_, b_ in STREAM_TICKETS:
+                record(*desk.process(s_, b_, cfg, k=top_k, cross_lingual=cross_lingual))
+        st.rerun()
+    labels = desk.triage.labels if desk.triage else {}
+    hitl.render(st, ss.queue, labels, auto_count=sum(h["status"] == hitl.AUTO for h in ss.history))
+    st.stop()
+
+
 # ----------------------------------------------------------------------------- input
 def _load_example():
     slug = LABELS.get(ss.example)
@@ -192,10 +217,20 @@ def _load_example():
 
 
 def _run(subject: str, body: str) -> None:
-    with st.spinner("Triaging, retrieving precedents and drafting ..."):
-        a = desk.analyse(subject, body, k=top_k, cross_lingual=cross_lingual)
+    """Runs the real pipeline and lights up the strip as each stage finishes (pause = presentation only)."""
+    done: dict = {}
+
+    def on_stage(key, a, gate=None, d=None):
+        done[key] = (*flow.summary(key, a, gate, d), a["timings_ms"].get(key))
+        nxt = next((k for k, _, _ in flow.STAGES if k not in done), None)
+        flow_slot.markdown(flow.render(done, running=nxt), unsafe_allow_html=True)
+        if stage_pause and nxt:
+            time.sleep(stage_pause)
+
+    flow_slot.markdown(flow.render({}, running="mask"), unsafe_allow_html=True)
+    a = desk.analyse(subject, body, k=top_k, cross_lingual=cross_lingual, on_stage=on_stage)
     ss.analysis = a
-    record(a, desk.decide(a, cfg)[0])
+    record(a, *desk.decide(a, cfg, on_stage=on_stage))
 
 
 qp = st.query_params.get("example")
@@ -203,7 +238,7 @@ if qp in EXAMPLES and ss.get("_qp") != qp:  # ?example=<slug> preloads and runs 
     ss._qp = qp
     _, ss.subject, ss.body = EXAMPLES[qp]
     ss.example = EXAMPLES[qp][0]
-    _run(ss.subject, ss.body)
+    ss._pending_run = True  # run below the form, where the pipeline strip lives
 
 st.selectbox("Load an example", [PLACEHOLDER] + list(LABELS), key="example", on_change=_load_example,
              label_visibility="collapsed")
@@ -211,7 +246,11 @@ with st.form("ticket"):
     subject = st.text_input("Subject (optional)", key="subject", placeholder="e.g. VPN gateway down")
     body = st.text_area("Ticket body", key="body", height=140, placeholder="Paste the raw customer message (English or German) ...")
     submitted = st.form_submit_button("Triage ticket", type="primary", width="stretch")
+flow_slot = st.empty()  # live pipeline strip
 
+if ss._pending_run:
+    ss._pending_run = False
+    _run(ss.subject, ss.body)
 if submitted:
     if not (subject.strip() or body.strip()):
         st.warning("Enter a subject or a body.")
@@ -244,6 +283,7 @@ if a is not None:
     t_dec = time.perf_counter()
     gate, d = desk.decide(a, cfg)
     decide_ms = (time.perf_counter() - t_dec) * 1000
+    flow_slot.markdown(flow.render(flow.full(a, gate, d)), unsafe_allow_html=True)
     tri = a["triage"]
     icon, label, color, tint = STATUS_STYLE[gate.status]
     left, right = st.columns([3, 2], gap="large")
@@ -254,7 +294,7 @@ if a is not None:
         st.markdown(f'<div class="sd-badge" style="border-color:{color};background:{tint}">'
                     f'<h3 style="color:{color}">{icon} {label}</h3>{reasons}</div>', unsafe_allow_html=True)
 
-        mode_label = {"extractive": "Offline extractive draft",
+        mode_label = {"llm": "LLM draft (verified)", "extractive": "Offline extractive draft",
                       "holding": "Holding reply (no grounded content)"}[d.mode]
         st.markdown(f"**Draft reply** · {mode_label} · language `{a['language']}` · cites "
                     + (", ".join(f"`{c}`" for c in d.cited_ticket_ids) or "none"))
@@ -282,14 +322,14 @@ if a is not None:
                     f'<div class="sd-conf">auto-detected</div></div>', unsafe_allow_html=True)
         c4.markdown(f'<div class="sd-card"><div class="sd-k">Critical</div><div class="sd-v">{tri["critical"]["score"]:.0%}</div>'
                     f'<div class="sd-conf">threshold {cfg.critical_threshold:.0%}</div></div>', unsafe_allow_html=True)
-        total = a["timings_ms"]["total"] + decide_ms
+        total = a["timings_ms"]["total"] + sum(a["timings_ms"].get(k, 0) for k in ("gate", "draft", "verify"))
         c5.markdown(f'<div class="sd-card"><div class="sd-k">Latency</div><div class="sd-v">{total:.0f} ms</div>'
                     f'<div class="sd-conf">end-to-end</div></div>', unsafe_allow_html=True)
-        stages = {**{k: v for k, v in a["timings_ms"].items() if k != "total"}, "gate + draft": decide_ms}
+        stages = {k: v for k, v in a["timings_ms"].items() if k != "total"}
         st.caption("Stage latency: " + " · ".join(f"{k} {v:.0f} ms" if v >= 1 else f"{k} <1 ms" for k, v in stages.items()))
 
     tab_prec, tab_triage, tab_guard, tab_queue = st.tabs(
-        ["📚 Precedents", "🧮 Triage detail", "🛡️ Guardrails", "📥 Session queue"])
+        ["📚 Precedents", "🧮 Triage detail", "🛡️ Guardrails", "📜 Session log"])
 
     with tab_prec:
         st.caption(f"Top-{len(a['precedents'])} resolved KB tickets (search: {desk.sources.get('Search')}, cosine shown). "
@@ -348,13 +388,12 @@ if a is not None:
             })
 
     with tab_queue:
-        if st.button(f"Stream {len(STREAM_TICKETS)} demo tickets"):
-            with st.spinner("Processing ..."):
-                for s_, b_ in STREAM_TICKETS:
-                    a_, g_, _ = desk.process(s_, b_, cfg, k=top_k, cross_lingual=cross_lingual)
-                    record(a_, g_)
+        st.caption(f"Every ticket this session. Tickets needing a human are in **{QUEUE_VIEW}** (switch at the top).")
         if ss.history:
             st.dataframe(pd.DataFrame(ss.history), width="stretch", hide_index=True)
+
+    st.divider()
+    trace.render(st, a, gate, d, cfg, bars, next((i for i in ss.queue if i["ref"] == a["ref"]), None))
 else:
     st.info("Paste a ticket or load an example to see triage, escalation, precedents and the grounded draft.")
     if ss.history:
