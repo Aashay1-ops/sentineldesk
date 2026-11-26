@@ -8,6 +8,31 @@ SentinelDesk takes an incoming support ticket (English or German) and:
 2. finds similar tickets we resolved in the past,
 3. decides whether the AI may answer or a human must take it.
 
+## About this repository
+
+Maintained by **Aashay** ([Aashay1-ops](https://github.com/Aashay1-ops)) as a personal project. This is the complete system our team built at the GDG Cloud Boston × Northeastern hackathon (November 2026), copied from the team repository [wuhong4088/HackathonGDG](https://github.com/wuhong4088/HackathonGDG) with its full commit history. It is licensed Apache-2.0 (see `LICENSE`), and I'll keep developing it here.
+
+**Who built what** (from the status board below and the commit history):
+
+| Part | Built by |
+|---|---|
+| **Verify step ⑤**: rule checks on every LLM draft (`sentineldesk/verify.py`, 161 tests, three adversarial review rounds) | **Aashay** (my part, [PR #5](https://github.com/wuhong4088/HackathonGDG/pull/5)) |
+| RAG plan, hybrid retrieval, Gemini draft step, pipeline glue, escalation gate | Chirag Mokashi |
+| Language detection | Hung Hsiao |
+| Triage ensemble, training, evaluation, requirements | Shatrunjaypratapsinh Gohil (SPGOHIL09) |
+| Live console UI | Sudeep KS |
+
+My solo re-implementation of the same idea, built independently before merging into the team build, is on the [`solo-prototype`](https://github.com/Aashay1-ops/sentineldesk/tree/solo-prototype) branch.
+
+**Run it:**
+1. `pip install -r requirements.txt`
+2. Build the split and the shared index: `python scripts/build_split.py`, then `python scripts/embed.py`.
+3. Train triage: `python scripts/train_triage.py` (the team ran this on Colab).
+4. Build the console's thresholds: `python scripts/build_ui_report.py`.
+5. Set `GEMINI_API_KEY`, then `streamlit run app.py`.
+
+`python check_rules.py` must print `OK`. The data (Hugging Face `Tobi-Bueck/customer-support-tickets`, CC-BY-NC-4.0) is downloaded, never committed. The rest of this README is the team's working document from the hackathon.
+
 ## Status board
 
 _Last updated 15:56. Update this table in the same commit as your work: change the status, add your name. Run `python check_rules.py` before every push._
