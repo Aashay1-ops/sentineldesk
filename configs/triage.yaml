@@ -1,0 +1,54 @@
+# SentinelDesk triage config. Everything tunable lives here.
+# Override the artifacts location with --artifacts or the SENTINELDESK_ARTIFACTS env var
+# (e.g. a Google Drive folder on Colab).
+
+paths:
+  artifacts_dir: artifacts
+  results_dir: results
+  index_dir: data/index      # team's shared embedding index (README "Shared embeddings file")
+
+data:
+  csv_path: data/tickets.csv   # what split.load_split reads; downloaded from the HF Hub if missing
+
+embedding:
+  model: intfloat/multilingual-e5-base      # team decision (README "Models (decided)"); e5-small = fast option
+  prefixes:                                 # e5 needs "query: "; bge-m3 needs nothing
+    intfloat/multilingual-e5-small: "query: "
+    intfloat/multilingual-e5-base: "query: "
+    intfloat/multilingual-e5-large: "query: "
+    BAAI/bge-m3: ""
+  batch_size: 64
+  max_seq_length: 512
+
+model_embed:               # model 0
+  C: 1.0
+
+model_tfidf:               # model 1
+  C: 4.0
+  use_char: true           # set false if char n-grams make training too slow
+  solver: liblinear        # benchmarked on half B (6k sample): 11x faster than saga, same or better F1
+  max_iter: 1000
+  tol: 0.001
+
+neighbours:                # model 2
+  k: 20
+  p: 1.0
+  alpha: 0.1
+  top_n_display: 5
+
+ensemble:                  # model 6, fitted on half A
+  method: pool             # pool = weighted average of log-probs (3 weights/task); stack = LR (original plan)
+  grid_step: 0.1           # pool weight grid
+  C: 1.0                   # stack only
+
+calibration:
+  ece_bins: 15
+  conf_threshold_min_bin: 10   # bins with fewer tickets are ignored for suggested thresholds
+  family_threshold: 0.98       # data audit #3: cosine >= this = reworded copy; halves A/B are drawn by whole family
+                               # and eval reports "novel" holdout tickets (no KB copy) separately
+
+critical:                  # model 5
+  target_recall: 0.90
+
+keywords:
+  path: keywords/outage_keywords.yaml

@@ -1,0 +1,31 @@
+# Outage keywords: INPUT FEATURES for the critical detector only. They never change labels.
+# Built from common sense (+ optional review of keywords/candidates.txt mined from `train` tags).
+# Never edit this by looking at holdout errors.
+en:
+  - outage
+  - down
+  - not working
+  - cannot access
+  - can't access
+  - no access
+  - unavailable
+  - all users
+  - everyone affected
+  - data loss
+  - breach
+  - ransomware
+  - crashed
+  - telemedicine
+  - EMR
+de:
+  - Ausfall
+  - ausgefallen
+  - kein Zugriff
+  - funktioniert nicht
+  - nicht erreichbar
+  - Störung
+  - alle Mitarbeiter
+  - alle Nutzer
+  - Datenverlust
+  - Sicherheitsvorfall
+  - abgestürzt

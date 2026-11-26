@@ -1,0 +1,13 @@
+# Same look as the prototype console; no deploy menu during the demo.
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f3f2ef"
+textColor = "#0b0b0b"
+
+[client]
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false

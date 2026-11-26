@@ -21,7 +21,7 @@ Checks (all run every time, so the agent sees every failure)
     language          the whole reply and every full sentence are in the ticket's language        VERIFY_FAILED
     unsupported_asks  the LLM listed nothing it could not ground                                  UNSUPPORTED_ASK
 
-Pure Python: re, difflib, decimal, unicodedata, plus this package's pii and language modules. Typically a few ms per draft.
+Pure Python: re, difflib, decimal, the repo's pii module and sentineldesk.language. Typically a few ms per draft.
 """
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ import re
 import unicodedata
 from decimal import Decimal, InvalidOperation
 
-from .language import detect_language_with_confidence
-from .pii import mask, normalize_placeholders
+from pii import mask, normalize_placeholders
+from sentineldesk.language import detect_language_with_confidence
 
 MAX_WORDS = 250
 MAX_CHARS = 3000          # one 40k-character "word" must not slip past MAX_WORDS or slow the checks down
@@ -648,7 +648,6 @@ def _check_language(reply, lang):
     if lang not in ("en", "de"):
         return False, f"ticket language {lang!r} is not en/de"
     clean = _URL.sub(" ", _PH_ANY.sub(" ", _TKT.sub(" ", reply)))
-    clean = re.sub(r"[\[{][^\]}\n]{0,40}[\]}]", " ", clean)  # [Your Name], {tel_num}: not language evidence
     n_words = len(_ALPHA_WORD.findall(clean))
     if n_words < MIN_WORDS_FOR_LANG:
         return True, f"too short to judge ({n_words} words); not enforced"
