@@ -1,0 +1,29 @@
+{
+  "dense": {
+    "top1_same_queue": 0.816,
+    "top5_same_queue_rate": 0.478,
+    "top1_same_type": 0.946,
+    "best_dense_cosine_mean": 0.931,
+    "no_precedent_rate": 0.0,
+    "cross_lingual_hit_share": 0.236,
+    "latency_ms_p50": 0.5
+  },
+  "bm25": {
+    "top1_same_queue": 0.747,
+    "top5_same_queue_rate": 0.419,
+    "top1_same_type": 0.906,
+    "best_dense_cosine_mean": 0.912,
+    "no_precedent_rate": 0.002,
+    "cross_lingual_hit_share": 0.104,
+    "latency_ms_p50": 0.4
+  },
+  "hybrid": {
+    "top1_same_queue": 0.777,
+    "top5_same_queue_rate": 0.446,
+    "top1_same_type": 0.923,
+    "best_dense_cosine_mean": 0.926,
+    "no_precedent_rate": 0.0,
+    "cross_lingual_hit_share": 0.124,
+    "latency_ms_p50": 0.8
+  }
+}
